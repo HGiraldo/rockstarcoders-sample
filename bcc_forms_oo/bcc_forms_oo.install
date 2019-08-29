@@ -1,0 +1,90 @@
+<?php
+
+/**
+ * @file
+ * Installation and uninstallation functions.
+ */
+
+/**
+ * Implements hook_schema().
+ */
+function bcc_forms_oo_schema() {
+
+  $schema['bcc_forms_oo'] = array(
+    'fields' => array(
+      'id' => array(
+        'description' => 'ID',
+        'type' => 'serial',
+        'not null' => TRUE,
+      ),
+      'nid' => array(
+        'description' => 'The Node Id',
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+      'status' => array(
+        'description' => 'Status',
+        'type' => 'varchar',
+        'length' => 255,
+        'not null' => TRUE,
+      ),
+      'created' => array(
+        'description' => 'Created timestamp',
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+      'data' => array(
+        'description' => 'Data',
+        'type' => 'blob',
+        'size' => 'big',
+        'not null' => TRUE,
+        'serialize' => TRUE,
+      ),
+    ),
+    'primary key' => array('id'),
+  );
+
+  $schema['bcc_forms_oo_components'] = array(
+    'fields' => array(
+      'id' => array(
+        'description' => 'ID',
+        'type' => 'serial',
+        'not null' => TRUE,
+      ),
+      'nid' => array(
+        'description' => 'The Node Id',
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+      'cid' => array(
+        'description' => 'The component Id',
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+      'oo_name' => array(
+        'description' => 'Open Office Name',
+        'type' => 'varchar',
+        'length' => 255,
+        'not null' => TRUE,
+      ),
+      'data' => array(
+        'description' => 'Data',
+        'type' => 'blob',
+        'size' => 'big',
+        'not null' => TRUE,
+        'serialize' => TRUE,
+      ),
+    ),
+    'primary key' => array('id'),
+  );
+
+  return $schema;
+}

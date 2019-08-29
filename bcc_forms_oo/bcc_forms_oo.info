@@ -1,0 +1,7 @@
+name = Bayside City Council: Webforms and Rex Integration.
+description = Integration module between Rex system and Drupal WebForms. Open Office CRMs / Web Services
+core = 7.x
+version = "7.x-0.1"
+package = Bayside
+dependencies[] = webform
+

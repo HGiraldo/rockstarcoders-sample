@@ -1,0 +1,636 @@
+<?php
+
+/**
+ * @file
+ * Integration module between Rex system and Drupal WebForms.
+ */
+
+/**
+ * Implements hook_menu().
+ */
+function bcc_forms_oo_menu() {
+
+  // Callbacks for multiple ajax.
+  $items['ajax-bs/set-location'] = array(
+    'title' => 'Ajax FEEDBACK',
+    'page callback'  => 'bcc_forms_oo_set_location',
+    'access arguments' => array('access content'),
+  );
+
+  return $items;
+}
+
+function bcc_forms_oo_set_location() {
+  $return = FALSE;
+  $cid = $_POST['cid'];
+  $id = $_POST['id'];
+  if ($cid && $id) {
+    $_SESSION['rex_locids'][$cid] = $id;
+  }
+  return $cid;
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function bcc_forms_oo_form_alter(&$form, &$form_state, $form_id) {
+  switch ($form_id) {
+
+    // Alter webform configuration form.
+    case 'webform_configure_form':
+      // Add @OpenOffice Options.
+      // Load Class.
+      $oo = bccoo_load($form['#node']->nid);
+
+      // Set message asking for Rex Refrence Field.
+      if (!$oo->getRexCid() && $oo->oo_status) {
+        drupal_set_message('<b><h3>You should create the Rex Reference field to use Rex integration. (form_key must be rex_reference). Also must be a hidden field.</b></h3>', 'warning');
+      }
+
+      $sub = isset($form_state['values']['bcc_oo']['bcc_oo_category']) ? $form_state['values']['bcc_oo']['bcc_oo_category'] : NULL;
+
+      if (!$sub) {
+        $sub = $oo->oo_cat;
+      }
+
+      // Validate Alternative category.
+      $disabled = FALSE;
+      if ($oo->oo_catsAlt && !empty($oo->oo_catsAlt)) {
+        $disabled = TRUE;
+      }
+
+      $form['bcc_oo'] = array(
+        '#type' => 'fieldset',
+        '#title' => '<b style="color: #1E01EC;">Open Office Integration</b>',
+        '#tree' => TRUE,
+        '#weight' => 99,
+        '#collapsible' => TRUE,
+        '#collapsed' => FALSE,
+        'bcc_oo_active' => array(
+          '#type' => 'checkbox',
+          '#title' => 'Active Open Office integration',
+          '#default_value' => $oo->oo_status,
+          '#description' => "<code>All submissions will be send it to Open Office CRMS</code>",
+        ),
+        'bcc_oo_category' => array(
+          '#type' => 'select',
+          '#title' => 'Category',
+          '#default_value' => $oo->oo_cat,
+          '#options' => $oo->getCategories(),
+          '#disabled' => $disabled,
+          '#ajax' => array(
+            'wrapper' => 'rex-wrapper-subcat',
+            'callback' => 'bcc_forms_oo_config_ajax'
+          ),
+        ),
+        'bcc_oo_subcategory' => array(
+          '#prefix' => '<div id="rex-wrapper-subcat">',
+          '#suffix' => '</div>',
+          '#type' => 'select',
+          '#title' => 'Sub-category',
+          '#default_value' => $oo->oo_subcat,
+          '#options' => $oo->getSubCategories($sub),
+          '#disabled' => $disabled,
+        ),
+        'bcc_oo_category_mix' => array(
+          '#type' => 'textfield',
+          '#title' => 'Alternative Category and Subcategory',
+          '#description' => 'If you fill this field the system will use it instead of previous selected options.<br><b>Example: Category Name|Sub-Category Name</b>',
+          '#default_value' => $oo->oo_catsAlt,
+        ),
+        'bcc_oo_custom_val' => array(
+          '#type' => 'select',
+          '#title' => 'Custom form validation',
+          '#options' => array(
+            '_none' => '- Select -',
+            'hardswaste' => 'Hard Waste Validation',
+          ),
+          '#default_value' => $oo->oo_custom_val,
+        ),
+      );
+
+      // Save object.
+      $form_state['storage']['oo'] = $oo;
+
+      // Add new Submit to create the record on DB.
+      $form['#submit'][] = 'bcc_forms_oo_config';
+      break;
+
+    // Alter webform component form.
+    case 'webform_component_edit_form':
+      // Add @OpenOffice Options.
+      // Load Class.
+      $oo = bccoo_load($form['#node']->nid);
+      $options = $oo->optionsMatch();
+
+      $load_comp = NULL;
+      if (isset($form['cid']['#value'])) {
+        $load_comp = $oo->loadComp($form['cid']['#value']);
+      }
+
+      // Default Text.
+      $text = NULL;
+      if (!$oo->oo_status) {
+        $text = array(
+          '#markup' => 'If you want to use Rex integration, go to <b>Form setting</b> tab.',
+        );
+      }
+
+      $form['bcc_oo_component'] = array(
+        '#type' => 'fieldset',
+        '#title' => '<b style="color: #1E01EC;">Open Office Integration</b>',
+        '#collapsible' => TRUE,
+        '#collapsed' => FALSE,
+        'bcc_oo_match' => array(
+          '#type' => 'select',
+          '#title' => 'Match with Open Office CRMS',
+          '#options' => $oo->optionsMatch(),
+          '#default_value' => isset($load_comp['oo_name']) ? $load_comp['oo_name'] : '_none',
+          '#description' => "<code>Will be match with remote services.</code>",
+        ),
+        'bcc_oo_include_desc' => array(
+          '#type' => 'checkbox',
+          '#title' => 'Include in description.?',
+          '#default_value' => isset($load_comp['data']['desc']) ? $load_comp['data']['desc'] : FALSE,
+          '#description' => "Will be added to main description.",
+        ),
+        'text' => $text,
+      );
+
+      // EXTRA options to validate fields.
+      // Location.
+      switch ($form['type']['#value']) {
+        case 'propertyaddress':
+          $form['bcc_oo_component']['bcc_oo_extraval'] = array(
+            '#type' => 'select',
+            '#title' => 'Extra validation for Address type field',
+            '#options' => array(
+              '_none' => '- Select -',
+              'GetHardRubbishCollectionsAvailableForPropertyResult' => 'GetHardRubbishCollectionsAvailableForPropertyResult',
+            ),
+            '#default_value' => isset($load_comp['data']['val']) ? $load_comp['data']['val'] : FALSE,
+          );
+          break;
+
+        default:
+          // code...
+          break;
+      }
+
+      // Add new Submit to create the record on DB.
+      $form['#submit'][] = 'bcc_forms_oo_component_submit';
+
+      break;
+
+    // Components Interface.
+    case 'webform_components_form':
+      // Load Class.
+      $oo = bccoo_load($form['#node']->nid);
+
+      // Set message asking for Rex Refrence Field.
+      if (!$oo->getRexCid() && $oo->oo_status) {
+        drupal_set_message('<b><h3>You should create the Rex Reference field to use Rex integration. (form_key must be rex_reference). Also must be a hidden field.</b></h3>', 'warning');
+      }
+      break;
+  }
+
+  if (drupal_substr($form_id, 0, 20) == 'webform_client_form_') {
+
+    // Load Class.
+    $oo = bccoo_load($form['#node']->nid);
+
+    // Is active?
+    if ($oo->oo_status) {
+      $form['details']['locations_info'] = array(
+        '#type' => 'textfield',
+        '#title' => 'Locations IDS',
+        '#title_display' => FALSE,
+        '#attributes' => array(
+          'class' => array('storage_location_ids', 'element-invisible'),
+        ),
+      );
+
+      // Extra Validation for Components.
+      $form['#validate'][] = 'bcc_forms_oo_validate_components';
+
+      // Extra general validation.
+      $form['#validate'][] = 'bcc_forms_oo_validate_form';
+
+      // hardwaste form
+      if (!empty($form['submitted']['main_info']['your_address']['address'])) {
+        $hw_address =& $form['submitted']['main_info']['your_address']['address'];
+        if ($gis_js = $hw_address['#attached']['js']['sites/all/modules/custom/bcc_open_office/js/gislookup_propertyaddress.js']) {
+          $hw_address['#attached']['js']['sites/all/modules/custom/bcc_open_office/js/gislookup_propertyaddress_hardwaste.js'] = $gis_js;
+          unset($hw_address['#attached']['js']['sites/all/modules/custom/bcc_open_office/js/gislookup_propertyaddress.js']);
+          $hw_address['#suffix'] = '<div class="hardwaste-error" style="display:none;color: #b5121b;font-weight: bold;">Our records indicate that this address has already received two hard waste collections this year, you will need to organise your own private hard waste collection. If you believe this message has been displayed in error, please contact the council on 9599 4444.</div>';
+        }
+      }
+    }
+
+    // Check Service.
+    if (!$oo->serviceExternalStatus()) {
+      // Pre Validataion. @todo
+    }
+  }
+}
+
+/**
+ * Implements form validate().
+ */
+function bcc_forms_oo_validate_components(&$form, &$form_state) {
+  $nid = $form['#node']->nid;
+  $comps = $form['#node']->webform['components'];
+  // Load Class.
+  $oo = bccoo_load($nid);
+
+  // VALIDATE COMPONENTS.
+  foreach ($comps as $key_c => $comp) {
+    $load_comp = $oo->loadComp($key_c);
+    if (isset($load_comp['data']['val'])) {
+
+      // Get Validation type.
+      $type_val = $load_comp['data']['val'];
+
+      // CHECK ALL EXTRA VALIDATIONS.
+      switch ($type_val) {
+
+        // VAL1: GetHardRubbishCollectionsAvailableForPropertyResult.
+        case "GetHardRubbishCollectionsAvailableForPropertyResult":
+          if (isset($_SESSION['rex_locids'][$key_c])) {
+
+            $address_code = $_SESSION['rex_locids'][$key_c];
+            $answer = bcc_open_office_GetHardRubbishCollectionsAvailableForProperty($address_code);
+
+            if (!$answer->Available) {
+              form_set_error($comp['form_key'], 'Our records indicate that this address has already received two hard waste collections this year, you will need to organise your own private hard waste collection. If you believe this message has been displayed in error, please contact the council on 9599 4444.');
+            }
+
+          }
+          break;
+
+        // VAL2: Phone.
+        case "phone":
+          // code...
+          break;
+      }
+    }
+  }
+}
+
+/**
+ * Implements form validate().
+ */
+function bcc_forms_oo_validate_form(&$form, &$form_state) {
+  $nid = $form['#node']->nid;
+  // Load Class.
+  $oo = bccoo_load($nid);
+
+  switch ($oo->oo_custom_val) {
+    // HARD WASTE VALIDATION
+    case 'hardswaste':
+      $get_nested = oo_get_nested($form_state['values'], 'hardrubbish_items');
+      if ($get_nested) {
+        $sub_category = bcc_forms_oo_setHardwasteSubCategory($get_nested);
+        if ($sub_category) {
+          form_set_value($form['submitted']['rex_subcat'], $sub_category, $form_state);
+        }
+        else {
+          form_set_error('Problems finding subcategory.');
+        }
+      }
+      break;
+  }
+
+  // Check Service.
+  if (!$oo->serviceExternalStatus()) {
+    form_set_error('Service temporarily unavailable', 'This service is temporarily unavailable, please call (03) 9599 4444 if your request is urgent');
+  }
+}
+
+
+/**
+ * Implements function HardWasteSubCategory.
+ *
+ * @param      array  $items
+ *   The items
+ *
+ * @return     string
+ *   { description_of_the_return_value }
+ */
+function bcc_forms_oo_setHardwasteSubCategory($items = array()) {
+  if ($items) {
+    $check = array();
+    foreach ($items as $value) {
+      if ($value) {
+        $check[] = $value;
+      }
+    }
+    sort($check);
+    $item_list = implode('-', $check);
+    $hardwaste_subcategories = array(
+      '243830' => 'Mattress',
+      '243832' => 'Bundled Branches/Christmas Trees (in January)',
+      '260557' => 'General',
+      '260562' => 'e waste',
+      '243830-243832' => 'Bundled Branches + Mattress',
+      '243830-260557' => 'General + Mattress',
+      '243830-260562' => 'e waste + Mattress',
+      '243832-260557' => 'General + Bundled Branches',
+      '243832-260562' => 'e waste + Bundled Branches',
+      '260557-260562' => 'General + e waste',
+      '243830-243832-260557' => 'General + Mattress + Bundled Branches',
+      '243830-243832-260562' => 'e waste + Bundled Branches + Mattress',
+      '243830-260557-260562' => 'General + e waste + Mattress',
+      '243832-260557-260562' => 'General + e waste + Bundled Branches',
+      '243830-243832-260557-260562' => 'General + e waste + Mattress + Bundled Branches');
+
+    if (isset($hardwaste_subcategories[$item_list])) {
+      return 'Hard Waste Booking - '. $hardwaste_subcategories[$item_list];
+    }
+  }
+  return NULL;
+}
+
+/**
+ * Implements function to get value from multidimentional array().
+ */
+function oo_get_nested($element, $name) {
+
+  foreach ($element as $key => $value) {
+    if ($key == $name) {
+      $finded = $value;
+      return $finded;
+    }
+    else {
+      if (is_array($value) && $finded = oo_get_nested($value, $name)) {
+       return $finded;
+     }
+   }
+ }
+
+ return false;
+}
+
+/**
+ * Implements form submit.
+ */
+function bcc_forms_oo_config(&$form, &$form_state) {
+  $oo_values = isset($form_state['values']['bcc_oo']) ? $form_state['values']['bcc_oo'] : NULL;
+  if (isset($oo_values)) {
+
+    $node = $form['#node'];
+    $status = $oo_values['bcc_oo_active'];
+    $cat = isset($oo_values['bcc_oo_category']) ? $oo_values['bcc_oo_category'] : '';
+    $subcat = isset($oo_values['bcc_oo_subcategory']) ? $oo_values['bcc_oo_subcategory'] : NULL;
+    $cats_alter = isset($oo_values['bcc_oo_category_mix']) ? $oo_values['bcc_oo_category_mix'] : NULL;
+    $custom_val = isset($oo_values['bcc_oo_custom_val']) ? $oo_values['bcc_oo_custom_val'] : NULL;
+
+    // Load Class.
+    $oo = bccoo_load($node->nid);
+
+    // SET CONFIG.
+    $oo->setStatusForm($status);
+
+    // SET CAT.
+    $oo->setCatForm($cat);
+
+    // SET SUBCAT.
+    $oo->setSubcatForm($subcat);
+
+    // Set Alternaive categories.
+    $oo->setCatAlternatives($cats_alter);
+
+    // Set Custom Val.
+    $oo->setCustomValidation($custom_val);
+  }
+}
+
+/**
+ * Implements Ajax Callback.
+ * Use to load subcategory options.
+ */
+function bcc_forms_oo_config_ajax(&$form, &$form_state) {
+  return $form['bcc_oo']['bcc_oo_subcategory'];
+}
+
+/**
+ * Implements submit function.
+ */
+function bcc_forms_oo_component_submit(&$form, &$form_state) {
+
+  if (isset($form_state['values']['bcc_oo_component'])) {
+    // General Values.
+    $values = $form_state['values'];
+
+    // Componets Values.
+    $values_component = $form_state['values']['bcc_oo_component'];
+
+    // Load Class Open Office.
+    $oo = bccoo_load($values['nid']);
+
+    // Set Up Webform component.
+    $comp = array(
+      'nid' => $values['nid'],
+      'cid' => $values['cid'],
+      'oo_name' => $values_component['bcc_oo_match'],
+      'oo_desc' => isset($values_component['bcc_oo_include_desc']) ? $values_component['bcc_oo_include_desc'] : FALSE,
+      'oo_extval' => isset($values_component['bcc_oo_extraval']) ? $values_component['bcc_oo_extraval'] : FALSE
+    );
+
+    $ans = $oo->setUpComp($comp);
+  }
+}
+
+/**
+ * { function_description }
+ *
+ * @param      <type>  $nid
+ *   The nid
+ *
+ * @return     bccoo
+ *   { description_of_the_return_value }
+ */
+function bccoo_load($nid = NULL) {
+  module_load_include('php', 'bcc_forms_oo', 'includes/bccoo.api');
+  return new bccoo($nid);
+}
+
+
+/**
+ * implements hook_webform_select_options_info
+ *
+ */
+function bcc_forms_oo_webform_select_options_info() {
+  $items = array();
+
+  $items['rex_street_types'] = array(
+    'title' => t('Street types from CRM'),
+    'options callback' => 'bcc_forms_oo_get_streets',
+  );
+
+  $items['rex_title_types'] = array(
+    'title' => t('Titles types from CRM'),
+    'options callback' => 'bcc_forms_oo_get_titles',
+  );
+
+  return $items;
+}
+
+/**
+ * Implements callback to Get streets list.
+ *
+ * @return     array $streets
+ *   Full list of streets.
+ */
+function bcc_forms_oo_get_streets() {
+  $oo = bccoo_load();
+  return $oo->getStreetTypes();
+}
+
+/**
+ * Implements callback to Get personal Titles list.
+ *
+ * @return     array $titles
+ *   Full list of Titles to use on Title Fields..
+ */
+function bcc_forms_oo_get_titles() {
+  $oo = bccoo_load();
+  return $oo->getTitleTypes();
+}
+
+/**
+ * Implements hook_webform_component_delete
+ */
+function bcc_forms_oo_webform_component_delete($component) {
+  // Delete a record in a 3rd-party module table when a component is deleted.
+  if (db_table_exists('bcc_forms_oo_components')) {
+    db_delete('bcc_forms_oo_components')
+      ->condition('nid', $component['nid'])
+      ->condition('cid', $component['cid'])
+      ->execute();
+  }
+}
+
+/**
+ * Implements hook_webform_share_export_alter().
+ */
+function bcc_forms_oo_webform_share_export_alter(&$node) {
+  $nid = $node->nid;
+  $webform =& $node->webform;
+  $webform['openOfficeSettings'] = array();
+
+  // Check General Settings.
+  $gs = db_select('bcc_forms_oo', 'oos')
+        ->fields('oos', array('data', 'status'))
+        ->condition('nid', $nid)
+        ->execute()
+        ->fetchAssoc();
+  if ($gs) {
+    $gs['data'] = unserialize($gs['data']);
+    $webform['openOfficeSettings']['general'] = $gs;
+  }
+
+  // Check Components.
+  $webform['openOfficeSettings']['components'] = array();
+  foreach ($webform['components'] as $key => $comp) {
+    $ckey = $comp['form_key'];
+    $cid = $comp['cid'];
+    // Check Component Settings.
+    $cs = db_select('bcc_forms_oo_components', 'ooc')
+          ->fields('ooc', array('oo_name', 'data'))
+          ->condition('nid', $nid)
+          ->condition('cid', $cid)
+          ->execute()
+          ->fetchAssoc();
+    if ($cs) {
+      $cs['data'] = unserialize($cs['data']);
+      $webform['openOfficeSettings']['components'][$ckey] = $cs;
+    }
+  }
+}
+
+/**
+ * Implements hook_node_update().
+ */
+function bcc_forms_oo_node_update($node) {
+  if ($node->type == 'webform' && isset($node->webform['openOfficeSettings'])) {
+    $nid = $node->nid;
+    // Load Class Open Office.
+    $oo = bccoo_load($nid);
+
+    // Update Components.
+    if ($node->webform['openOfficeSettings']['components']) {
+      $comps = $node->webform['openOfficeSettings']['components'];
+      foreach ($comps as $key => $comp) {
+        $cid = db_select('webform_component', 'wcp')
+                ->fields('wcp', array('cid'))
+                ->condition('nid', $nid)
+                ->condition('form_key', $key)
+                ->execute()
+                ->fetchField();
+
+        // Set Up Webform component.
+        if ($cid && is_numeric($cid)) {
+          $comp = array(
+            'nid' => $nid,
+            'cid' => $cid,
+            'oo_name' => $comp['oo_name'],
+            'data' => isset($comp['data']) ? $comp['data'] : array()
+          );
+          $ans = $oo->setUpComp($comp);
+        }
+      }
+    }
+
+    // General Configuration.
+    if ($node->webform['openOfficeSettings']['general']) {
+      $gs = $node->webform['openOfficeSettings']['general'];
+      // SET CONFIG.
+      $oo->setStatusForm($gs['status']);
+
+      // SET CAT.
+      if (isset($gs['data']['cat'])) {
+        $oo->setCatForm($gs['data']['cat']);
+      }
+
+      // SET SUBCAT.
+      if (isset($gs['data']['subcat'])) {
+        $oo->setSubcatForm($gs['data']['subcat']);
+      }
+
+      // Set Alternaive categories.
+      if (isset($gs['data']['alternative'])) {
+        $oo->setCatAlternatives($gs['data']['alternative']);
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_webform_submission_presave().
+ */
+function bcc_forms_oo_webform_submission_presave($node, &$submission) {
+  try {
+
+    $oo = bccoo_load($node->nid);
+    if ($oo->oo_status) {
+      // Send submission to CRMS.NET
+      if (isset($submission->data)) {
+        $answ = $oo->sendSub($submission->data);
+        if (!$answ->response->SubmitRequestResult->Success) {
+          // stop submission
+          drupal_set_message('There is an error when submitting your request, please call (03) 9599 4444 if your request is urgent', 'warning');
+          drupal_goto("node/{$node->nid}");
+        }
+        $cid_rex = $oo->getRexCid();
+        if ($answ->rex_reference && !empty($answ->rex_reference) && $cid_rex) {
+          $submission->data[$cid_rex][0] = $answ->rex_reference;
+        }
+      }
+    }
+
+  } catch (Exception $e) {
+
+    watchdog('RexRequest', "Error setup rex reference : %msg", array('%msg' => $e->getMessage()), WATCHDOG_ERROR);
+  }
+}
