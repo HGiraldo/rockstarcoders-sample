@@ -1,0 +1,9 @@
+name = VATE MYOB Integration
+description = Sync the website data to MYOB
+core = 7.x
+package = VATE
+
+configure = admin/config/myob
+
+files[] = includes/myob.inc
+files[] = includes/myob_mapping_object.entity.inc

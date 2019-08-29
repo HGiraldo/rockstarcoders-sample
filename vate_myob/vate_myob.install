@@ -1,0 +1,299 @@
+<?php
+
+/**
+ * Implements hook_schema().
+ */
+function vate_myob_schema() {
+
+  // Object mapping table.
+  $schema['myob_mapping_object'] = array(
+    'description' => 'Drupal to MYOB object mappings',
+    'fields' => array(
+      'myob_mapping_object_id' => array(
+        'type' => 'serial',
+        'not null' => TRUE,
+        'description' => 'Primary Key: Unique myob_mapping_object entity ID.',
+      ),
+      'myob_id' => array(
+        'description' => 'MYOB object identifier',
+        'type' => 'varchar',
+        'length' => 32,
+        'not null' => TRUE,
+        'default' => '',
+      ),
+      'myob_type' => array(
+        'description' => 'MYOB object type.',
+        'type' => 'varchar',
+        'length' => 128,
+        'not null' => TRUE,
+        'default' => '',
+      ),
+      'entity_id' => array(
+        'description' => 'Drupal entity Id.',
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+      'entity_type' => array(
+        'description' => 'Drupal entity type.',
+        'type' => 'varchar',
+        'length' => 128,
+        'not null' => TRUE,
+        'default' => '',
+      ),
+      'created' => array(
+        'description' => 'The Unix timestamp when the object mapping was created.',
+        'type' => 'int',
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+      'entity_updated' => array(
+        'description' => 'The Unix timestamp when the mapped Drupal entity was last updated.',
+        'type' => 'int',
+        'not null' => FALSE,
+        'default' => 0,
+      ),
+      'last_sync' => array(
+        'description' => 'The Unix timestamp when the record was last synced with MYOB.',
+        'type' => 'int',
+        'not null' => FALSE,
+        'default' => 0,
+      ),
+      'last_sync_status' => array(
+        'description' => 'The last sync status.',
+        'type' => 'int',
+        'size' => 'tiny',
+        'not null' => TRUE,
+        'default' => 0,
+        'unsigned' => TRUE,
+      ),
+      'order_id' => array(
+        'description' => 'Order Id',
+        'type' => 'varchar',
+        'length' => 128,
+        'not null' => FALSE,
+        'default' => '',
+      ),
+    ),
+    'primary key' => array('myob_mapping_object_id'),
+    'indexes' => array(
+      'drupal_entity' => array('entity_type', 'entity_id'),
+      'myob_object' => array('myob_type', 'myob_id'),
+    ),
+    'unique keys' => array(
+      'myob' => array('myob_type', 'myob_id'),
+      'myob_drupal' => array('entity_type', 'entity_id'),
+    ),
+  );
+
+  // Object mapping table.
+  $schema['myob_isa'] = array(
+    'description' => 'MYOB Income Sales Accounts',
+    'fields' => array(
+      'id' => array(
+        'type' => 'serial',
+        'not null' => TRUE,
+        'description' => 'Primary Key: Unique ID.',
+      ),
+      'myob_uid' => array(
+        'description' => 'MYOB uid',
+        'type' => 'varchar',
+        'length' => 32,
+        'not null' => TRUE,
+        'default' => '',
+      ),
+      'myob_number' => array(
+        'description' => 'MYOB account number',
+        'type' => 'varchar',
+        'length' => 32,
+        'not null' => TRUE,
+        'default' => '',
+      ),
+      'myob_name' => array(
+        'description' => 'MYOB account name.',
+        'type' => 'varchar',
+        'length' => 128,
+        'not null' => TRUE,
+        'default' => '',
+      ),
+      'created' => array(
+        'description' => 'The Unix timestamp when the object mapping was created.',
+        'type' => 'int',
+        'not null' => TRUE,
+        'default' => 0,
+      )
+    ),
+    'primary key' => array('id')
+  );
+
+  return $schema;
+}
+
+/**
+ * Create new table myob_mapping_object
+ */
+function vate_myob_update_7100(&$sandbox) {
+  $myob_mapping_object_schema = array(
+    'description' => 'Drupal to MYOB object mappings',
+    'fields' => array(
+      'myob_mapping_object_id' => array(
+        'type' => 'serial',
+        'not null' => TRUE,
+        'description' => 'Primary Key: Unique myob_mapping_object entity ID.',
+      ),
+      'myob_id' => array(
+        'description' => 'MYOB object identifier',
+        'type' => 'varchar',
+        'length' => 32,
+        'not null' => TRUE,
+        'default' => '',
+      ),
+      'myob_type' => array(
+        'description' => 'MYOB object type.',
+        'type' => 'varchar',
+        'length' => 128,
+        'not null' => TRUE,
+        'default' => '',
+      ),
+      'entity_id' => array(
+        'description' => 'Drupal entity Id.',
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+      'entity_type' => array(
+        'description' => 'Drupal entity type.',
+        'type' => 'varchar',
+        'length' => 128,
+        'not null' => TRUE,
+        'default' => '',
+      ),
+      'created' => array(
+        'description' => 'The Unix timestamp when the object mapping was created.',
+        'type' => 'int',
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+      'entity_updated' => array(
+        'description' => 'The Unix timestamp when the mapped Drupal entity was last updated.',
+        'type' => 'int',
+        'not null' => FALSE,
+        'default' => 0,
+      ),
+      'last_sync' => array(
+        'description' => 'The Unix timestamp when the record was last synced with MYOB.',
+        'type' => 'int',
+        'not null' => FALSE,
+        'default' => 0,
+      ),
+      'last_sync_status' => array(
+        'description' => 'The last sync status.',
+        'type' => 'int',
+        'size' => 'tiny',
+        'not null' => TRUE,
+        'default' => 0,
+        'unsigned' => TRUE,
+      ),
+    ),
+    'primary key' => array('myob_mapping_object_id'),
+    'indexes' => array(
+      'drupal_entity' => array('entity_type', 'entity_id'),
+      'myob_object' => array('myob_type', 'myob_id'),
+    ),
+    'unique keys' => array(
+      'myob' => array('myob_type', 'myob_id'),
+      'myob_drupal' => array('entity_type', 'entity_id'),
+    ),
+  );
+  db_create_table('myob_mapping_object', $myob_mapping_object_schema);
+}
+
+
+/**
+ * Implements hook_update().
+ * Remove data from "queue" and truncate table "myob_mapping_object"
+ */
+function vate_myob_update_7101(&$sandbox) {
+  // Delete all orders Info from queue.
+  if (db_table_exists('queue')) {
+    db_delete('queue')
+      ->condition('name', 'myob_commerce_order_push')
+      ->execute();
+
+    $s_query = new EntityFieldQuery();
+    $s_query->entityCondition('entity_type', 'commerce_order')
+      ->propertyCondition('status', array('pending', 'completed'), 'IN');
+    $result = $s_query->execute();
+    if (isset($result['commerce_order'])) {
+      foreach ($result['commerce_order'] as $order_id => $value) {
+        $order = commerce_order_load($order_id);
+        vate_myob_add_order_queue($order);
+      }
+    }
+  }
+
+  // Truncate Table myob_mapping_object
+  if (db_table_exists('myob_mapping_object')) {
+    db_truncate('myob_mapping_object')->execute();
+  }
+}
+
+/**
+ * Implements hook_update().
+ * Remove data from "queue" and truncate table "myob_mapping_object"
+ */
+function vate_myob_update_7102(&$sandbox) {
+  // Delete all orders Info from queue.
+  if (db_table_exists('queue')) {
+    db_delete('queue')
+      ->condition('name', 'myob_commerce_order_push')
+      ->execute();
+
+    $s_query = new EntityFieldQuery();
+    $s_query->entityCondition('entity_type', 'commerce_order')
+      ->propertyCondition('status', array('pending', 'completed'), 'IN');
+    $result = $s_query->execute();
+    if (isset($result['commerce_order'])) {
+      foreach ($result['commerce_order'] as $order_id => $value) {
+        $order = commerce_order_load($order_id);
+        vate_myob_add_order_queue($order);
+      }
+    }
+  }
+
+  // Truncate Table myob_mapping_object
+  if (db_table_exists('myob_mapping_object')) {
+    db_truncate('myob_mapping_object')->execute();
+  }
+}
+
+/**
+ * Implements hook_update().
+ * Add new field to table.
+ */
+function vate_myob_update_7103(&$sandbox) {
+  $table = 'myob_mapping_object';
+  if (db_table_exists($table)) {
+    $schema = drupal_get_schema_unprocessed('vate_myob', $table);
+    if (isset($schema['fields']['order_id'])) {
+      db_add_field($table, 'order_id', $schema['fields']['order_id']);
+    }
+  }
+}
+
+/**
+ * Implements hook_update().
+ * Create table for MYOB Income Sales Accounts.
+ */
+function vate_myob_update_7106(&$sandbox) {
+  $table = 'myob_isa';
+  if (!db_table_exists($table)) {
+    $schema = drupal_get_schema_unprocessed('vate_myob', $table);
+    db_create_table($table, $schema);
+    if (function_exists('vate_myob_reload_sales_accounts')) {
+      vate_myob_reload_sales_accounts(FALSE);
+    }
+  }
+}

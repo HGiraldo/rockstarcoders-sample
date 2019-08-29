@@ -1,0 +1,2051 @@
+<?php
+
+/**
+ * @file
+ * VATE MYOB module code.
+ */
+
+define('MYOB_ORDER_PUSH_QUEUE', 'myob_commerce_order_push');
+
+/**
+ * Mapping object sync statuses.
+ */
+define('MYOB_MAPPING_STATUS_SUCCESS', 1);
+define('MYOB_MAPPING_STATUS_ERROR', 0);
+
+/**
+* Implements hook_menu()
+*/
+function vate_myob_menu() {
+  $items = array();
+
+  $items['admin/config/myob'] = array(
+    'title' => 'MYOB',
+    'description' => 'MYOB settings.',
+    'position' => 'right',
+    'page callback' => 'system_admin_menu_block_page',
+    'access arguments' => array('access administration pages'),
+    'file path' => drupal_get_path('module', 'system'),
+    'file' => 'system.admin.inc',
+  );
+  $items['admin/config/myob/authorize'] = array(
+    'title' => 'Authorize',
+    'description' => 'Authorize this website to communicate with MYOB.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('vate_myob_oauth_form'),
+    'access arguments' => array('administer myob'),
+    'type' => MENU_NORMAL_ITEM,
+    'weight' => 0,
+  );
+  $items['admin/config/myob/settings'] = array(
+    'title' => 'Settings',
+    'description' => 'Additional settings for the MYOB Export.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('vate_myob_settings_form'),
+    'access arguments' => array('administer myob'),
+    'type' => MENU_NORMAL_ITEM,
+    'weight' => 1,
+  );
+  $items['admin/config/myob/refresh_sa'] = array(
+    'title' => 'Refresh Income Sales Accounts',
+    'description' => 'Sync MYOB ISA and Drupal ',
+    'page callback' => 'vate_myob_reload_sales_accounts',
+    'access arguments' => array('administer myob'),
+    'type' => MENU_NORMAL_ITEM,
+    'weight' => 2,
+  );
+  $items['myob/oauth_callback'] = array(
+    'title' => 'MYOB oauth callback',
+    'page callback' => 'vate_myob_oauth_callback',
+    'access arguments' => array('access content'),
+    'type' => MENU_CALLBACK,
+  );
+
+  // Payment tab on orders.
+  $items['admin/commerce/orders/%commerce_order/myob'] = array(
+    'title' => 'MYOB Sync',
+    'page callback' => 'vate_myob_order_proccess',
+    'page arguments' => array(3),
+    'access callback' => 'commerce_payment_transaction_order_access',
+    'access arguments' => array('view', 3),
+    'type' => MENU_LOCAL_TASK,
+    'weight' => 15,
+    'context' => MENU_CONTEXT_PAGE | MENU_CONTEXT_INLINE
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_permission().
+ */
+function vate_myob_permission() {
+  return array(
+    'administer myob' => array(
+      'title' => t('administer MYOB'),
+      'description' => t('Administer MYOB integration.'),
+      'restrict access' => TRUE,
+    ),
+  );
+}
+
+/**
+ * Implements hook_action_info().
+ */
+function vate_myob_action_info() {
+  return array(
+    'vate_myob_bulk_add_order_queue' => array(
+      'type' => 'commerce_order',
+      'label' => t('Add orders to queue for MYOB Export'),
+      'configurable' => FALSE,
+      'vbo_configurable' => FALSE,
+      'triggers' => array('any'),
+    ),
+  );
+}
+
+function vate_myob_bulk_add_order_queue($object, $context = array()) {
+  $order = $object;
+  $queue = DrupalQueue::get(MYOB_ORDER_PUSH_QUEUE);
+  $queue->createItem(array(
+    'entity_type' => 'commerce_order',
+    'entity_id' => $order->order_id,
+  ));
+}
+
+/**
+ * Implements hook_rules_action_info().
+ */
+function vate_myob_rules_action_info() {
+  $actions = array();
+
+  $actions['vate_myob_add_order_queue'] = array(
+    'label' => t('Add order to queue for MYOB Export'),
+    'group' => t('Vate rules'),
+    'parameter' => array(
+      'commerce_order' => array(
+        'type' => 'commerce_order',
+        'label' => t('Commerce Order'),
+      ),
+    ),
+  );
+
+  $actions['vate_myob_push_order'] = array(
+    'label' => t('MYOB: Push Order to essentials'),
+    'group' => t('Vate rules'),
+    'parameter' => array(
+      'commerce_order' => array(
+        'type' => 'commerce_order',
+        'label' => t('Commerce Order'),
+      ),
+    ),
+  );
+
+  return $actions;
+}
+
+/**
+ * Callback function for rule action.
+ */
+function vate_myob_add_order_queue($order) {
+  $queue = DrupalQueue::get(MYOB_ORDER_PUSH_QUEUE);
+  $result = $queue->createItem(array(
+    'entity_type' => 'commerce_order',
+    'entity_id' => $order->order_id,
+  ));
+  $params = array('@id' => $order->order_id);
+  if ($result === TRUE) {
+    watchdog('vate_myob', 'The order @id has been added to the MYOB queue.', $params, WATCHDOG_INFO);
+  } else {
+    watchdog('vate_myob', 'There is a an error when adding order @id to the MYOB queue.', $params, WATCHDOG_ERROR);
+  }
+}
+
+/**
+ * Implements hook_entity_update().
+ */
+function vate_myob_entity_update($entity, $type) {
+  // Source attached to entity.
+  if (($type == 'commerce_payment_transaction')
+    && !empty($entity->order_id)
+    && ($entity->payment_method == 'commerce_purchase_order')
+    && ($entity->status == 'success')) {
+    $queue = DrupalQueue::get(MYOB_ORDER_PUSH_QUEUE);
+    $result = $queue->createItem(array(
+      'entity_type' => 'commerce_order',
+      'entity_id' => $entity->order_id,
+    ));
+  }
+}
+
+/**
+ * Generate the MYOB authorization form.
+ *
+ * @return array
+ *   The MYOB authorization form.
+ */
+function vate_myob_oauth_form($form, &$form_state) {
+  $form = array();
+
+  $api_key = variable_get('myob_api_key', FALSE);
+  $api_secret = variable_get('myob_api_secret', FALSE);
+  $business_uid = variable_get('myob_business_uid', FALSE);
+
+  $form['message'] = array(
+    '#type' => 'item',
+    '#markup' => t('Authorize this website to communicate with MYOB by entering the API key and secret from a remote application. <br>Clicking authorize will redirect you to MYOB where you will be asked to grant access.'),
+  );
+
+  $form['myob_api_key'] = array(
+    '#title' => t('MYOB API key'),
+    '#type' => 'textfield',
+    '#description' => t('API key of the MYOB remote application you want to grant access to'),
+    '#required' => TRUE,
+    '#default_value' => $api_key,
+  );
+  $form['myob_api_secret'] = array(
+    '#title' => t('MYOB API secret'),
+    '#type' => 'textfield',
+    '#description' => t('API secret of the MYOB remote application you want to grant access to'),
+    '#required' => TRUE,
+    '#default_value' => $api_secret,
+  );
+  $form['submit'] = array(
+    '#value' => t('Authorize'),
+    '#type' => 'submit',
+  );
+
+  // If we're authenticated, show a list of available REST businesses.
+  try {
+    if ($api_key && $api_secret) {
+      $myobapi = new MYOB($api_key, $api_secret);
+      // If fully configured, attempt to connect to MYOB and return a list
+      // of businesses.
+      if ($myobapi->isAuthorized()) {
+        try {
+          $businesses = $myobapi->listBusinesses();
+          $items[0] = '- Select Business -';
+          $list_businesses = '<ul>';
+          foreach ($businesses as $key => $business) {
+            $items[$business['uid']] = $business['name'] . ' (' . $business['firstName'] . ' ' . $business['lastName'] . ')';
+            $list_businesses .= '<li>'.$items[$business['uid']] . ' (' . $business['status'] . ')</li>';
+          }
+          $list_businesses .= '</ul>';
+
+          if (($business_uid > 0) && !in_array($business_uid, array_keys($items))) {
+            // existing business_uid no longer in the list for this API, reset to empty
+            variable_set('myob_business_uid', '');
+            // reset all other myob settings variable
+            variable_set('myob_book_sale_account_uid', '');
+            variable_set('myob_event_booking_sale_account_uid', '');
+            variable_set('myob_membership_sale_account_uid', '');
+            variable_set('myob_shipping_sale_account_uid', '');
+            variable_set('myob_payment_account_uid', '');
+            variable_set('myob_sale_tax_type_uid', '');
+
+            drupal_set_message('Your MYOB settings has been reset, please go to MYOB settings page to reconfigure.', 'status');
+          }
+          $form['businesses'] = array(
+            '#markup' => '<p>Your MYOB instance is authorized. Below are the list of businesses linked to this API.</p>' . $list_businesses . '<br>
+            <p>Click <a href="/admin/config/myob/settings">here</a> to configure your MYOB settings.</p>',
+          );
+        }
+        catch(MYOBException $e) {
+          vate_myob_set_message($e->getMessage(), 'warning');
+        }
+      }
+      else {
+        vate_myob_set_message(t('MYOB needs to be authorized to connect to this website.'), 'error');
+      }
+    }
+  } catch (Exception $e) {
+    watchdog('vate_myob', 'Conection Error.', array(), WATCHDOG_ERROR);
+  }
+
+  return $form;
+}
+
+
+/**
+ * Submit handler for vate_myob_oauth_form().
+ *
+ * @param array $form
+ *   The form array.
+ * @param array $form_state
+ *   The form state array.
+ */
+function vate_myob_oauth_form_submit($form, &$form_state) {
+  $api_key = $form_state['values']['myob_api_key'];
+  $api_secret = $form_state['values']['myob_api_secret'];
+  variable_set('myob_api_key', $api_key);
+  variable_set('myob_api_secret', $api_secret);
+
+  $myob = new MYOB($api_key, $api_secret);
+  $myob->getAccessCode();
+}
+
+/**
+ * Generate the MYOB settings form.
+ */
+function vate_myob_settings_form($form, &$form_state) {
+  $myobapi = vate_myob_get_api();
+  if ($myobapi->isAuthorized()) {
+    $businesses = $myobapi->listBusinesses();
+
+    // Save $businesses.
+    $form_state['storage']['businesses'] = $businesses;
+
+    $business_items[0] = '- Select Business -';
+    foreach ($businesses as $key => $business) {
+      if (drupal_strtolower($business['status']) == 'active') {
+        $business_items[$business['uid']] = $business['name'] . ' (' . $business['firstName'] . ' ' . $business['lastName'] . ')';
+      }
+    }
+    $form['myob_business_uid'] = array(
+      '#type' => 'select',
+      '#title' => t('MYOB Business'),
+      '#options' => $business_items,
+      '#default_value' => variable_get('myob_business_uid', ''),
+    );
+    if ($myobapi->getBusinessUid()) {
+      // shipping items
+      $shippings = $myobapi->listItems('shipping');
+      $shipping_items = array(''=>'Select Shipping Item');
+      foreach ($shippings as $shipping) {
+        $shipping_items[$shipping['uid']] = $shipping['name'];
+      }
+      $form['myob_shipping_item_uid'] = array(
+        '#type' => 'select',
+        '#title' => t('MYOB Shipping Item'),
+        '#options' => $shipping_items,
+        '#default_value' => variable_get('myob_shipping_item_uid', ''),
+      );
+      if (empty($shippings)) {
+        $form['myob_shipping_item_uid']['#description'] = 'Please create an item in MYOB with the name contain "shipping"';
+      }
+
+      // Income Accounts.
+      $accounts = $myobapi->listAccounts('income');
+      $items = array(''=>'Select Account');
+      $payment_items = $items;
+      foreach ($accounts as $account) {
+        $acname = $account['name'];
+        $account_name = $account['type']['name'];
+        $account_did = $account['displayId'];
+        $items[$account['uid']] = $account_name.' '. $account_did .' '. $acname;
+      }
+
+      $form['myob_book_sale_account_uid'] = array(
+        '#type' => 'select',
+        '#title' => t('MYOB Book/PDF/Print Sale Account'),
+        '#options' => $items,
+        '#default_value' => variable_get('myob_book_sale_account_uid', ''),
+      );
+      $form['myob_event_booking_sale_account_uid'] = array(
+        '#type' => 'select',
+        '#title' => t('MYOB Event Booking Sale Account'),
+        '#options' => $items,
+        '#default_value' => variable_get('myob_event_booking_sale_account_uid', ''),
+      );
+      $form['myob_membership_sale_account_uid'] = array(
+        '#type' => 'select',
+        '#title' => t('MYOB Membership Sale Account'),
+        '#options' => $items,
+        '#default_value' => variable_get('myob_membership_sale_account_uid', ''),
+      );
+      $form['myob_shipping_sale_account_uid'] = array(
+        '#type' => 'select',
+        '#title' => t('Shipping Sale Account'),
+        '#options' => $items,
+        '#default_value' => variable_get('myob_shipping_sale_account_uid', ''),
+      );
+
+      // Banking Accounts.
+      $banking_options = array();
+      $banking_accounts = $myobapi->listAccounts('banking');
+      foreach ($banking_accounts as $account) {
+        $acname = $account['name'];
+        $account_name = $account['type']['name'];
+        $account_did = $account['displayId'];
+        $banking_options[$account['uid']] = $account_name.' '. $account_did .' '. $acname;
+      }
+      $form['myob_payment_account_uid'] = array(
+        '#type' => 'select',
+        '#title' => t('MYOB Payment Account'),
+        '#options' => $banking_options,
+        '#default_value' => variable_get('myob_payment_account_uid', ''),
+      );
+
+      // Tax Accounts.
+      $taxTypes = $myobapi->listTaxTypes();
+      $tax_items = array(''=>'Select Tax Type');
+      foreach ($taxTypes as $taxType) {
+        $tax_items[$taxType['uid']] = $taxType['code'].' - '.$taxType['name'];
+      }
+      $form['myob_sale_tax_type_uid'] = array(
+        '#type' => 'select',
+        '#title' => t('MYOB Sale Tax Type'),
+        '#options' => $tax_items,
+        '#default_value' => variable_get('myob_sale_tax_type_uid', ''),
+      );
+    }
+  } else {
+    $form['not_authorised'] = array(
+      '#markup' => '<p>You need to <a href="/admin/config/myob/authorize">authorize</a> your MYOB instance.</p>',
+    );
+    return $form;
+  }
+
+  // Testing Mode.
+  $form['myob_testing'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Testing mode'),
+    '#default_value' => variable_get('myob_testing', FALSE),
+  );
+  // Cron System.
+  $form['myob_cron_activated'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Cron activated'),
+    '#description' => 'Use this option to pull VATE information to MYOB usign the Drupal cron system',
+    '#default_value' => variable_get('myob_cron_activated', FALSE),
+  );
+
+  return system_settings_form($form);
+}
+
+/**
+ * Page Callbak for MYOB ISA.
+ */
+function vate_myob_reload_sales_accounts($redirect = TRUE) {
+  $ban = FALSE;
+  try {
+    $myobapi = vate_myob_get_api();
+    if ($myobapi->isAuthorized()) {
+      $accounts = $myobapi->listAccounts('income');
+      if (!empty($accounts) && is_array($accounts)) {
+        // Truncate.
+        db_truncate('myob_isa')->execute();
+        $count = 0;
+        // Fill it again.
+        foreach ($accounts as $account) {
+          $acname = $account['name'];
+          $record = array(
+            "myob_uid" => $account['uid'],
+            "myob_number" => $account['displayId'],
+            "myob_name" => $account['name'],
+            "created" => time(),
+          );
+          if ($result = drupal_write_record('myob_isa', $record)) {
+            $count++;
+            $ban = TRUE;
+          }
+        }
+      }
+    }
+  } catch (Exception $e) {
+    $ban = FALSE;
+  }
+  if ($ban) {
+    drupal_set_message("$count accounts imported.");
+  }
+  else {
+    drupal_set_message("Something went wrong. Try again.", 'warning');
+  }
+  if ($redirect) {
+    drupal_goto('admin/config/myob');
+  }
+  return TRUE;
+}
+
+/**
+ * Validate Sale Account in myob_isa.
+ */
+function vate_myob_validate_sales_accounts($account_id) {
+  if ($account_id) {
+    $query = db_select('myob_isa', 'isa')
+            ->fields('isa', array('myob_uid'))
+            ->condition('myob_uid', $account_id)
+            ->execute()
+            ->fetchAssoc('myob_uid');
+    if (isset($query['myob_uid']) && !empty($query['myob_uid'])) {
+      return $query['myob_uid'] == $account_id ? TRUE : FALSE;
+    }
+  }
+  return FALSE;
+}
+
+/**
+ * Validate get MYOB ISA.
+ */
+function vate_myob_get_isa() {
+  $income_options = array();
+  $query = db_select('myob_isa', 'isa')->fields('isa', array('myob_uid'));
+  $query->addExpression("CONCAT(isa.myob_number, ' - ', isa.myob_name)", 'name');
+  $results = $query->execute()->fetchAllKeyed(0, 1);
+  if (isset($results) && !empty($results)) {
+    return $results;
+  }
+  return array();
+}
+
+function vate_myob_oauth_callback() {
+  // If no code is provided, return access denied.
+  if (!isset($_GET['code'])) {
+    return drupal_access_denied();
+  }
+  $myob = vate_myob_get_api();
+  if ($myob->requestToken($_GET['code'])) {
+    vate_myob_set_message(t('MYOB OAUTH2 authorization successful.'));
+
+    // Rebuild the menu so the mappings links are now available.
+    menu_rebuild();
+  }
+  else {
+    vate_myob_set_message(t('MYOB OAUTH2 authorization failed.'), 'warning');
+  }
+
+  drupal_goto('admin/config/myob/authorize');
+}
+
+/**
+ * Wrapper around the API constructor passing API key and secret.
+ *
+ * @return MYOB
+ *   Returns a MYOB class object.
+ */
+function vate_myob_get_api() {
+  return new MYOB(
+    variable_get('myob_api_key', ''),
+    variable_get('myob_api_secret', '')
+  );
+}
+
+/**
+ * VATE MYOB set message.
+ *
+ * Wrapper around drupal_set_message(), checks for proper permissions.
+ */
+function vate_myob_set_message($message = NULL, $type = 'status', $repeat = TRUE) {
+  global $user;
+  if ($user->uid == 1 || user_access('administer myob', $user)) {
+    drupal_set_message($message, $type, $repeat);
+  }
+}
+
+
+/**
+ * Implements hook_cron().
+ */
+function vate_myob_cron() {
+  if (variable_get('myob_cron_activated', FALSE)) {
+    // Get MYOB Class.
+    $myobapi = vate_myob_get_api();
+
+    // Have access?
+    if ($myobapi->isAuthorized()) {
+      $queue = DrupalQueue::get(MYOB_ORDER_PUSH_QUEUE);
+      $limit = 30;
+      $success_orders = 0;
+      $success_payments = 0;
+      $processed_order_ids = array();
+
+      for ($i = 0; $i < $limit; $i++) {
+        $item = $queue->claimItem();
+        // We do this after the "for()" so that when we reach the limit, we don't
+        // incidentally claim a queue license on an item we aren't going to process.
+        if (!$item) {
+          break;
+        }
+
+        if ($item->data['entity_type'] == 'commerce_order') {
+          $order_id = $item->data['entity_id'];
+          if (in_array($order_id, $processed_order_ids)) {
+            // Prevent duplicate order export
+            $queue->deleteItem($item);
+            _remove_order_from_queue($order_id);
+            $limit++;
+            continue;
+          }
+          $processed_order_ids[$order_id] = $order_id;
+
+          if ($order = commerce_order_load($order_id)) {
+
+            // Initialize @myob variable.
+            $myob_contact_id = FALSE;
+
+            // Get Order Wrapper.
+            $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+
+            // Initialize @order variables.
+            $order_total = $order_wrapper->commerce_order_total->value();
+            $order_num = $order_wrapper->order_number->value();
+            $order_timestamp = $order_wrapper->created->value();
+            $order_date = new DateTime();
+            $order_date->setTimezone(new DateTimeZone("Australia/Melbourne"));
+            $order_date->setTimestamp($order_timestamp);
+
+            // **************************************
+            // ******** START CONTACT AREA **********
+            // **************************************
+
+            // CREATE OR UPDATE drupal USERS in MYOB. (Customers users)
+            // Also, It will mapping the myob_mapping_object table in order
+            // to update existing users in MYOB.
+            if ($user_order = $order_wrapper->owner->value()) {
+              $owner = $user_order;
+            }
+            else {
+              $owner = user_load(1);
+            }
+            if ($owner) {
+              // Get Params from order.
+              $params = vate_myob_get_contact_params($owner, $order_wrapper);
+
+              // Get MYOB contact id.
+              $myob_contact_id = vate_myob_upsert_mapping($myobapi, 'user', $owner->uid, 'contact', $params, $order_id);
+            }
+
+            if (!$myob_contact_id) {
+              watchdog('vate_myob', 'Order No: %order_num. No contact ID information.', array('%order_num' => $order_num), WATCHDOG_ERROR);
+              return TRUE;
+            }
+            // ******** END CONTACT AREA **********
+
+
+            $myob_sale_tax_type_uid = variable_get('myob_sale_tax_type_uid', '');
+            $myob_shipping_sale_account_uid = variable_get('myob_shipping_sale_account_uid', '');
+
+
+            // **************************************
+            // ******** START PRODUCT AREA **********
+            // **************************************
+
+            // Initialize @order variables.
+            $has_errors = FALSE;
+
+            // Get Commerce Line Items.
+            $lines = array();
+
+            // Check all line items.
+            foreach ($order_wrapper->commerce_line_items as $delta => $line_item_wrapper) {
+
+              // Get initial values from Line Item.
+              // Total order Price
+              $total_price = $line_item_wrapper->commerce_total->value();
+              // Unit Price.
+              $unit_price = $line_item_wrapper->commerce_unit_price->value();
+
+              // Has any product?
+              if (!empty($line_item_wrapper->commerce_product)) {
+                // Product Id.
+                $product_id = $line_item_wrapper->commerce_product->getIdentifier();
+                $product_label = $line_item_wrapper->commerce_product->label();
+
+                // Get main info from order.
+                $params = vate_myob_item_params_from_order($line_item_wrapper);
+
+                // Must have Sale Account in order to create.
+                if (isset($params['saleAccount'])) {
+
+                  // Try get mapping MYOB item or create a new one.
+                  try {
+                    $myob_item_id = vate_myob_upsert_mapping($myobapi, 'commerce_product', $product_id, 'item', $params, $order_id);
+                    if ($myob_item_id) {
+                      $line = array(
+                        'account' => $params['saleAccount'],
+                        'taxType' => array('uid' => $myob_sale_tax_type_uid),
+                        'item' => array('uid' => $myob_item_id),
+                        'unitOfMeasure' => 'QTY',
+                        'description' => $params['description'],
+                        'quantity' => (int) $line_item_wrapper->quantity->raw(),
+                        'unitPrice' => ($unit_price['amount'] / 100),
+                        'total' => ($total_price['amount'] / 100),
+                        'lilabel' => $line_item_wrapper->line_item_label->value(),
+                      );
+
+                      // @see MYOB GST settings. (https://essentials.myob.com.au)
+                      // Are you registered for GST?
+                      if (!$myobapi->gstRegistered || $myobapi->gstRegistered == FALSE) {
+                        unset($line['taxType']);
+                      }
+
+                      $lines[] = $line;
+                    }
+                    else {
+                      // NEEDS TO BE UPDATED.
+                      // Validate if we can get taht element from MYOB using the "number" property.
+                      watchdog('vate_myob', 'Order No: %order_num. Create/update item failed: %product_label (%product_id)',
+                        array(
+                          '%order_num' => $order_num,
+                          '%product_id' => $product_id,
+                          '%product_label' => $product_label
+                        ),
+                        WATCHDOG_ERROR
+                      );
+                    }
+                  } catch (Exception $e) {
+                    watchdog('vate_myob', 'Order No: %order_num. Create/update inventory item failed: %error_msg', array('%order_num' => $order_num,'%error_msg' => $e->getMessage()), WATCHDOG_WARNING);
+                    $has_errors = true;
+                  }
+                }
+                else {
+                  // No sales account.
+                  watchdog('vate_myob', '(Line %line) Order No: %order_num. Create/update item failed: No sales account for -> %product_label (%product_id)',
+                    array(
+                      '%order_num' => $order_num,
+                      '%product_id' => $product_id,
+                      '%product_label' => $product_label,
+                      '%line' => __LINE__
+                    ),
+                    WATCHDOG_ERROR
+                  );
+                }
+              } elseif ($line_item_wrapper->getBundle() == 'shipping') {
+                // Cannot map shipping because it is not an entity
+                $myob_shipping_item_id = variable_get('myob_shipping_item_uid', '');
+                if ($myob_shipping_item_id != '') {
+                  $line = array(
+                    'account' => array('uid' => $myob_shipping_sale_account_uid),
+                    'item' => array('uid' => $myob_shipping_item_id),
+                    'taxType' => array('uid' => $myob_sale_tax_type_uid),
+                    'unitOfMeasure' => 'QTY',
+                    'description' => $line_item_wrapper->line_item_label->value(),
+                    'quantity' => (int) $line_item_wrapper->quantity->raw(),
+                    'unitPrice' => ($unit_price['amount'] / 100)
+                  );
+                  // @see MYOB GST settings. (https://essentials.myob.com.au)
+                  // Are you registered for GST?
+                  if (!$myobapi->gstRegistered || $myobapi->gstRegistered == FALSE) {
+                    unset($line['taxType']);
+                  }
+                  $lines[] = $line;
+                }
+              }
+            }
+            // If Empty, stop the process.
+            if (empty($lines)) {
+              watchdog('vate_myob', 'Order No: %order_num. No products found. Process stopped.', array(
+                '%order_num' => $order_num
+              ), WATCHDOG_ERROR);
+              $queue->deleteItem($item);
+              _remove_order_from_queue($order_id);
+              continue;
+            }
+            // ******** END PRODUCT AREA **********
+
+
+            // ************************************************
+            // ******** START INVOICE & PAYMENT AREA **********
+            // ************************************************
+
+            // Initialize @myob variable.
+            $myob_invoice_id = $myob_payment_id = $delete_item = $no_invoice_required = FALSE;
+
+            // Initialize @order variables.
+            $prefix = "WSIV";
+            if (variable_get('myob_testing', FALSE)) {
+              $prefix = "XXXX";
+            }
+            $issueDate = $order_date->format('Y-m-d\TH:i:s');
+            $invoiceNumber = "{$prefix}" . str_pad($order_num, 8, 0, STR_PAD_LEFT);
+            // GET NEXT REFERENCE FROM MYOB (NEW SERVICE).
+            try {
+                if ($next_ref = $myobapi->getNextInvoiceReference()) {
+                    $next_ref = trim($next_ref);
+                    if (strlen($next_ref) > 1) {
+                        $invoiceNumber = $next_ref;
+                    }
+                }
+            } catch (Exception $e) {
+                watchdog('vate_myob', 'Error getting next invoice reference: %error_msg', array('%error_msg' => $e->getMessage()), WATCHDOG_ERROR);
+            }
+
+            // Validate previous actions.
+            if (!$has_errors && !empty($lines)) {
+              $params = array(
+                'invoiceNumber' => substr($invoiceNumber, 0, 12),
+                'contact' => array ('uid' => $myob_contact_id),
+                'issueDate' => $issueDate,
+                'gstInclusive' => TRUE,
+                'lines' => $lines,
+                'notes' => "Web order #: {$order_id}",
+                'purchaseOrderNumber' => NULL,
+                'total' => ($order_total['amount'] / 100),
+                'gst' => 0.91,
+                'amountPaid' => ($order_total['amount'] / 100),
+                'amountDue' => 0,
+                'status' => "Open",
+                'displayStatus' => "Paid",
+                'onlinePaymentEnabled' => TRUE
+              );
+
+              // Notes.
+              $order_notes = $order_wrapper->field_commerce_invoice_notes->value();
+              if ($order_notes && isset($order_notes['value'])) {
+                $order_notes = strip_tags($order_notes['value']);
+                $order_notes = check_plain($order_notes);
+                $params['notes'] .= " - {$order_notes}";
+              }
+
+              // Validate type of payment.
+              $query = new EntityFieldQuery();
+              $query->entityCondition('entity_type', 'commerce_payment_transaction')
+                    ->propertyCondition('order_id', $order_id)
+                    // ->propertyCondition('payment_method', 'commerce_purchase_order')
+                    ->propertyCondition('status', 'failure','!=');
+              $results = $query->execute();
+              if (!empty($results['commerce_payment_transaction'])) {
+                $commerce_payment_transaction = current($results['commerce_payment_transaction']);
+                $transaction = commerce_payment_transaction_load($commerce_payment_transaction->transaction_id);
+
+                // PURCHASE ORDER.
+                if ($transaction->payment_method == 'commerce_purchase_order') {
+                  if (!empty($transaction->message_variables['@po_number'])) {
+                    $purchaseOrderNumber = trim($transaction->message_variables['@po_number']);
+                    $purchaseOrderNumber = drupal_strtolower($purchaseOrderNumber);
+                    $purchaseOrderNumber = str_replace(" ", "-", $purchaseOrderNumber);
+                    $purchaseOrderNumber = substr($purchaseOrderNumber, 0, 15);
+                    $params['purchaseOrderNumber'] = $purchaseOrderNumber;
+                  }
+                }
+
+                // Not payment required
+                $payment_methods = array(
+                  'direct_transfer',
+                  'commerce_purchase_order',
+                );
+
+                if (in_array($transaction->payment_method, $payment_methods)) {
+                  $no_invoice_required = TRUE;
+                  $params['displayStatus'] = "Not Paid";
+                  switch ($transaction->payment_method) {
+                    case 'direct_transfer':
+                      $params['notes'] .= "| Direct Transfer payment.";
+                      break;
+
+                    case 'commerce_purchase_order':
+                      $params['notes'] .= "| PO payment.";
+                      break;
+                  }
+                }
+              }
+
+              // Create invoice or get existing invoice id
+              // NOTE: if we do update, due date is mandatory
+              try {
+                $myob_invoice_id = vate_myob_upsert_mapping($myobapi, 'commerce_order', $order_id, 'invoice', $params, TRUE, $order_id);
+                watchdog('vate_myob', 'Order No: %order_num. Exported to MYOB.', array('%order_num' => $order_num), WATCHDOG_INFO);
+              } catch (MYOBException $e) {
+                // invoice create failed
+                watchdog('vate_myob', 'Order No: %order_num. Create invoice failed: %error_msg', array('%order_num' => $order_num,'%error_msg' => $e->getMessage()), WATCHDOG_ERROR);
+                // todo: count the failed create?
+              }
+
+              // **************** PAYMENT ******************
+
+              if ($myob_invoice_id && !$no_invoice_required) {
+                // Variables.
+                $delete_item = TRUE;
+                $success_orders++;
+
+                // Create invoice success, add payment
+                // Get success payment
+                $payment_params = vate_myob_payment_params_from_order($order_wrapper,$myob_invoice_id,$myob_contact_id);
+                if (!empty($payment_params)) {
+
+                  // Transaction ID.
+                  $transaction_id = $payment_params['transaction_id'];
+                  unset($payment_params['transaction_id']);
+
+                  // NOTE: we can only create payment (no update)
+                  try {
+                    if ($new_payment = $myobapi->createEntity('payment',$payment_params)) {
+                      $myob_payment_id = $new_payment['uid'];
+                      // save mapping
+                      vate_myob_save_mapping('commerce_payment_transaction',$transaction_id,'payment',$myob_payment_id, $order_id);
+                      watchdog('vate_myob', 'Order No: %order_num. Payment added to MYOB.', array('%order_num' => $order_num), WATCHDOG_INFO);
+                      _remove_order_from_queue($order_id);
+                      $success_payments++;
+                    }
+                  } catch (Exception $e) {
+                    watchdog('vate_myob', 'Order No: %order_num. Add payment failed: %error_msg', array('%order_num' => $order_num,'%error_msg' => $e->getMessage()), WATCHDOG_ERROR);
+                    $delete_item = false;
+                  }
+                }
+
+                // Remove from Drupal:Queue
+                if ($delete_item) {
+                  $queue->deleteItem($item);
+                }
+
+              } elseif ($no_invoice_required) {
+                $success_orders++;
+                $queue->deleteItem($item);
+                watchdog('vate_myob', 'Order No: %order_num. No payment needed to MYOB', array('%order_num' => $order_num), WATCHDOG_INFO);
+                _remove_order_from_queue($order_id);
+              }
+            } else {
+              watchdog('vate_myob', '(Line %line) Order No: %order_num. MYOB export failed, error when exporting order item.', array('%order_num' => $order_num, '%line' => __LINE__), WATCHDOG_ERROR);
+            }
+          }
+          else {
+            // Remove Old commerce orders in DrupalQueue
+            $queue->deleteItem($item);
+            _remove_order_from_queue($order_id);
+          }
+        }
+      }
+
+      watchdog('vate_myob', 'MYOB export run: %success_orders orders and %success_payments payments are exported.', array('%success_orders' => $success_orders, '%success_payments' => $success_payments), WATCHDOG_INFO);
+    } else {
+      watchdog('vate_myob', 'MYOB export not run. MYOB API is not authorized.', array(), WATCHDOG_INFO);
+    }
+  }
+}
+
+/**
+ * Show Local MYOB data related to an order.
+ */
+function vate_myob_order_proccess($order) {
+  $myobapi = vate_myob_get_api();
+  $business_id = $myobapi->infoBusiness['uid'];
+
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+  $db_select = db_select('myob_mapping_object', 'my')
+              ->fields('my', array('myob_type', 'myob_id', 'last_sync', 'entity_id'))
+              ->condition('order_id', $order->order_id)
+              ->execute()
+              ->fetchAll();
+  $total_order = $order_wrapper->commerce_order_total->value();
+  $total_order = isset($total_order['amount']) ? $total_order['amount'] : 0;
+
+  $payments = commerce_payment_transaction_load_multiple(
+    array(),
+    array('order_id' => $order->order_id)
+  );
+
+  $total_payments = 0;
+  if ($payments && !empty($payments)) {
+    foreach ($payments as $key => $payment) {
+      $total_payments += $payment->amount;
+    }
+  }
+
+  $balance = $total_order - $total_payments;
+  $sync_available = FALSE;
+  if ($balance == 0) {
+    $sync_available = TRUE;
+  }
+
+  $rows = array();
+  $myob_invoice = $myob_payment = FALSE;
+  $attr_l = array(
+    'attributes' => array(
+      'target' => '_blank',
+    )
+  );
+  if ($db_select && !empty($db_select)) {
+    foreach ($db_select as $key => $row) {
+      $row = (array) $row;
+
+      switch ($row['myob_type']) {
+        case 'invoice':
+          $myob_invoice = TRUE;
+          $uid = $row['myob_id'];
+          $attr_path = "businesses/{$business_id}/invoices/{$uid}";
+          $row['myob_id'] = l($uid, "https://essentials.myob.com.au/LA/app.htm#{$attr_path}", $attr_l);
+          break;
+
+        case 'payment':
+          $myob_payment = TRUE;
+          $uid = $row['myob_id'];
+          $attr_path = "businesses/{$business_id}/invoices/payment/view/{$uid}";
+          $row['myob_id'] = l($uid, "https://essentials.myob.com.au/LA/app.htm#{$attr_path}", $attr_l);
+          break;
+      }
+
+      $row['myob_type'] = drupal_strtoupper($row['myob_type']);
+      $row['last_sync'] = format_date($row['last_sync'], 'short');
+      $rows[] = $row;
+    }
+  }
+
+  $table = NULL;
+  if ($rows && !empty($rows)) {
+    $vars = array(
+      'header' => array('Myob Type', 'Myob ID', 'Last Sync', 'Drupal ID'),
+      'rows' => $rows,
+    );
+    $table = theme('table', $vars);
+  }
+
+  // Get Form to Sync.
+  $form_sync = NULL;
+  if (!$myob_invoice && !$myob_payment) {
+    $form_sync = drupal_get_form('vate_myob_order_proccess_form', $order_wrapper);
+    $form_sync = render($form_sync);
+  }
+
+
+  return $table . $form_sync;
+}
+
+/**
+ * Implements form to Sync order to MYOB.
+ */
+function vate_myob_order_proccess_form($form, &$form_state, $order_wrapper) {
+  $form_state['storage']['order'] = $order_wrapper->value();
+  $form['sync'] = array(
+    '#type' => 'submit',
+    '#value' => 'Sync order to MYOB',
+  );
+  return $form;
+}
+
+/**
+ * Implements form submit.
+ */
+function vate_myob_order_proccess_form_submit($form, &$form_state) {
+  if (isset($form_state['storage']['order'])) {
+    _vate_myob_set_single_order($form_state['storage']['order']);
+  }
+}
+
+/**
+ * Rule Action()
+ */
+function vate_myob_push_order($order) {
+  _vate_myob_set_single_order($order);
+}
+
+/**
+ * Function to Push single orders to MYOB.
+ */
+function _vate_myob_set_single_order($order) {
+  if (isset($order->order_id)) {
+    // Validate Code. // Repeat
+    // @see vate_myob_cron
+
+    $myobapi = vate_myob_get_api();
+    $order_id = $order->order_id;
+
+    // Initialize @myob variable.
+    $myob_contact_id = FALSE;
+
+    // Get Order Wrapper.
+    $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+
+    // Initialize @order variables.
+    $order_total = $order_wrapper->commerce_order_total->value();
+    $order_num = $order_wrapper->order_number->value();
+    $order_timestamp = $order_wrapper->created->value();
+    $order_date = new DateTime();
+    $order_date->setTimezone(new DateTimeZone("Australia/Melbourne"));
+    $order_date->setTimestamp($order_timestamp);
+
+    // **************************************
+    // ******** START CONTACT AREA **********
+    // **************************************
+
+    // CREATE OR UPDATE drupal USERS in MYOB. (Customers users)
+    // Also, It will mapping the myob_mapping_object table in order
+    // to update existing users in MYOB.
+
+    // @see VALIDATE USER.
+    if ($user_order = $order_wrapper->owner->value()) {
+      $owner = $user_order;
+    }
+    else {
+      $owner = user_load(1);
+    }
+
+    if ($owner) {
+      // Get Params from order.
+      $params = vate_myob_get_contact_params($owner, $order_wrapper);
+
+      // Get MYOB contact id.
+      $myob_contact_id = vate_myob_upsert_mapping($myobapi, 'user', $owner->uid, 'contact', $params, $order_id);
+    }
+
+    if (!$myob_contact_id) {
+      watchdog('vate_myob', 'Order No: %order_num. No contact ID information.', array('%order_num' => $order_num), WATCHDOG_ERROR);
+      return TRUE;
+    }
+    // ******** END CONTACT AREA **********
+
+
+    $myob_sale_tax_type_uid = variable_get('myob_sale_tax_type_uid', '');
+    $myob_shipping_sale_account_uid = variable_get('myob_shipping_sale_account_uid', '');
+
+
+    // **************************************
+    // ******** START PRODUCT AREA **********
+    // **************************************
+
+    // Initialize @order variables.
+    $has_errors = FALSE;
+
+    // Get Commerce Line Items.
+    $lines = array();
+
+    // Check all line items.
+    foreach ($order_wrapper->commerce_line_items as $delta => $line_item_wrapper) {
+
+      // Get initial values from Line Item.
+      // Total order Price
+      $total_price = $line_item_wrapper->commerce_total->value();
+      // Unit Price.
+      $unit_price = $line_item_wrapper->commerce_unit_price->value();
+
+      // Has any product?
+      if (!empty($line_item_wrapper->commerce_product)) {
+        // Product Id.
+        $product_id = $line_item_wrapper->commerce_product->getIdentifier();
+        $product_label = $line_item_wrapper->commerce_product->label();
+
+        // Get main info from order.
+        $params = vate_myob_item_params_from_order($line_item_wrapper);
+
+        // Must have Sale Account in order to create.
+        if (isset($params['saleAccount'])) {
+
+          // Try get mapping MYOB item or create a new one.
+          try {
+            $myob_item_id = vate_myob_upsert_mapping($myobapi, 'commerce_product', $product_id, 'item', $params, $order_id);
+            if ($myob_item_id) {
+              $line = array(
+                'account' => $params['saleAccount'],
+                'taxType' => array('uid' => $myob_sale_tax_type_uid),
+                'item' => array('uid' => $myob_item_id),
+                'unitOfMeasure' => 'QTY',
+                'description' => $params['description'],
+                'quantity' => (int) $line_item_wrapper->quantity->raw(),
+                'unitPrice' => ($unit_price['amount'] / 100),
+                'total' => ($total_price['amount'] / 100),
+                'lilabel' => $line_item_wrapper->line_item_label->value(),
+              );
+
+              // @see MYOB GST settings. (https://essentials.myob.com.au)
+              // Are you registered for GST?
+              if (!$myobapi->gstRegistered || $myobapi->gstRegistered == FALSE) {
+                unset($line['taxType']);
+              }
+
+              $lines[] = $line;
+            }
+            else {
+              // NEEDS TO BE UPDATED.
+              // Validate if we can get taht element from MYOB using the "number" property.
+              watchdog('vate_myob', 'Order No: %order_num. Create/update item failed: %product_label (%product_id)',
+                array(
+                  '%order_num' => $order_num,
+                  '%product_id' => $product_id,
+                  '%product_label' => $product_label
+                ),
+                WATCHDOG_ERROR
+              );
+            }
+          } catch (Exception $e) {
+            watchdog('vate_myob', 'Order No: %order_num. Create/update inventory item failed: %error_msg', array('%order_num' => $order_num,'%error_msg' => $e->getMessage()), WATCHDOG_WARNING);
+            $has_errors = true;
+          }
+        }
+        else {
+          // No sales account.
+          watchdog('vate_myob', '(Line %line) Order No: %order_num. Create/update item failed: No sales account for -> %product_label (%product_id)',
+            array(
+              '%order_num' => $order_num,
+              '%product_id' => $product_id,
+              '%product_label' => $product_label,
+              '%line' => __LINE__
+            ),
+            WATCHDOG_ERROR
+          );
+        }
+      } elseif ($line_item_wrapper->getBundle() == 'shipping') {
+        // Cannot map shipping because it is not an entity
+        $myob_shipping_item_id = variable_get('myob_shipping_item_uid', '');
+        if ($myob_shipping_item_id != '') {
+          $line = array(
+            'account' => array('uid' => $myob_shipping_sale_account_uid),
+            'item' => array('uid' => $myob_shipping_item_id),
+            'taxType' => array('uid' => $myob_sale_tax_type_uid),
+            'unitOfMeasure' => 'QTY',
+            'description' => $line_item_wrapper->line_item_label->value(),
+            'quantity' => (int) $line_item_wrapper->quantity->raw(),
+            'unitPrice' => ($unit_price['amount'] / 100)
+          );
+          // @see MYOB GST settings. (https://essentials.myob.com.au)
+          // Are you registered for GST?
+          if (!$myobapi->gstRegistered || $myobapi->gstRegistered == FALSE) {
+            unset($line['taxType']);
+          }
+          $lines[] = $line;
+        }
+      }
+    }
+    // If Empty, stop the process.
+    if (empty($lines)) {
+      watchdog('vate_myob', 'Order No: %order_num. No products found. Process stopped.', array(
+        '%order_num' => $order_num
+      ), WATCHDOG_ERROR);
+      return TRUE;
+    }
+    // ******** END PRODUCT AREA **********
+
+
+    // ************************************************
+    // ******** START INVOICE & PAYMENT AREA **********
+    // ************************************************
+
+    // Initialize @myob variable.
+    $myob_invoice_id = $myob_payment_id = $delete_item = $no_invoice_required = FALSE;
+
+    // Initialize @order variables.
+    $prefix = "WSIV";
+    if (variable_get('myob_testing', FALSE)) {
+      $prefix = "XXXX";
+    }
+    $issueDate = $order_date->format('Y-m-d\TH:i:s');
+    $invoiceNumber = "{$prefix}" . str_pad($order_num, 8, 0, STR_PAD_LEFT);
+    // GET NEXT REFERENCE FROM MYOB (NEW SERVICE).
+    try {
+        if ($next_ref = $myobapi->getNextInvoiceReference()) {
+            $next_ref = trim($next_ref);
+            if (strlen($next_ref) > 1) {
+                $invoiceNumber = $next_ref;
+            }
+        }
+    } catch (Exception $e) {
+        watchdog('vate_myob', 'Error getting next invoice reference: %error_msg', array('%error_msg' => $e->getMessage()), WATCHDOG_ERROR);
+    }
+
+    // Validate previous actions.
+    // @see https://developer.myob.com/api/essentials-accounting/endpoints/sale/invoices/
+    if (!$has_errors && !empty($lines)) {
+      $params = array(
+        'invoiceNumber' => substr($invoiceNumber, 0, 12),
+        'contact' => array ('uid' => $myob_contact_id),
+        'issueDate' => $issueDate,
+        'gstInclusive' => TRUE,
+        'lines' => $lines,
+        'notes' => "Web order #: {$order_id}",
+        'purchaseOrderNumber' => NULL,
+        'total' => ($order_total['amount'] / 100),
+        'gst' => 0.91,
+        'amountPaid' => ($order_total['amount'] / 100),
+        'amountDue' => 0,
+        'status' => "Open",
+        'displayStatus' => "Paid",
+        'onlinePaymentEnabled' => TRUE
+      );
+
+      // Notes.
+      $order_notes = $order_wrapper->field_commerce_invoice_notes->value();
+      if ($order_notes && isset($order_notes['value'])) {
+        $order_notes = strip_tags($order_notes['value']);
+        $order_notes = check_plain($order_notes);
+        $params['notes'] .= " - {$order_notes}";
+      }
+
+      // Validate type of payment.
+      $query = new EntityFieldQuery();
+      $query->entityCondition('entity_type', 'commerce_payment_transaction')
+            ->propertyCondition('order_id', $order_id)
+            // ->propertyCondition('payment_method', 'commerce_purchase_order')
+            ->propertyCondition('status', 'failure','!=');
+      $results = $query->execute();
+      if (!empty($results['commerce_payment_transaction'])) {
+        $commerce_payment_transaction = current($results['commerce_payment_transaction']);
+        $transaction = commerce_payment_transaction_load($commerce_payment_transaction->transaction_id);
+
+        // PURCHASE ORDER.
+        if ($transaction->payment_method == 'commerce_purchase_order') {
+          if (!empty($transaction->message_variables['@po_number'])) {
+            $purchaseOrderNumber = trim($transaction->message_variables['@po_number']);
+            $purchaseOrderNumber = drupal_strtolower($purchaseOrderNumber);
+            $purchaseOrderNumber = str_replace(" ", "-", $purchaseOrderNumber);
+            $purchaseOrderNumber = substr($purchaseOrderNumber, 0, 15);
+            $params['purchaseOrderNumber'] = $purchaseOrderNumber;
+          }
+        }
+
+        // Not payment required
+        $payment_methods = array(
+          'direct_transfer',
+          'commerce_purchase_order',
+        );
+
+        if (in_array($transaction->payment_method, $payment_methods)) {
+          $no_invoice_required = TRUE;
+          $params['displayStatus'] = "Not Paid";
+          switch ($transaction->payment_method) {
+            case 'direct_transfer':
+              $params['notes'] .= "| Direct Transfer payment.";
+              break;
+
+            case 'commerce_purchase_order':
+              $params['notes'] .= "| PO payment.";
+              break;
+          }
+        }
+      }
+
+      // Create invoice or get existing invoice id
+      // NOTE: if we do update, due date is mandatory
+      try {
+        $myob_invoice_id = vate_myob_upsert_mapping($myobapi, 'commerce_order', $order_id, 'invoice', $params, TRUE, $order_id);
+        watchdog('vate_myob', 'Order No: %order_num. Exported to MYOB.', array('%order_num' => $order_num), WATCHDOG_INFO);
+      } catch (MYOBException $e) {
+        // invoice create failed
+        watchdog('vate_myob', 'Order No: %order_num. Create invoice failed: %error_msg', array('%order_num' => $order_num,'%error_msg' => $e->getMessage()), WATCHDOG_ERROR);
+        // todo: count the failed create?
+      }
+
+      // **************** PAYMENT ******************
+
+      if ($myob_invoice_id && !$no_invoice_required) {
+        // Variables.
+        $delete_item = TRUE;
+
+        // Create invoice success, add payment
+        // Get success payment
+        $payment_params = vate_myob_payment_params_from_order($order_wrapper,$myob_invoice_id,$myob_contact_id);
+        if (!empty($payment_params)) {
+
+          // Transaction ID.
+          $transaction_id = $payment_params['transaction_id'];
+          unset($payment_params['transaction_id']);
+
+          // NOTE: we can only create payment (no update)
+          try {
+            if ($new_payment = $myobapi->createEntity('payment',$payment_params)) {
+              $myob_payment_id = $new_payment['uid'];
+              // save mapping
+              vate_myob_save_mapping('commerce_payment_transaction',$transaction_id,'payment',$myob_payment_id, $order_id);
+              watchdog('vate_myob', 'Order No: %order_num. Payment added to MYOB.', array('%order_num' => $order_num), WATCHDOG_INFO);
+              _remove_order_from_queue($order_id);
+            }
+          } catch (Exception $e) {
+            watchdog('vate_myob', 'Order No: %order_num. Add payment failed: %error_msg', array('%order_num' => $order_num,'%error_msg' => $e->getMessage()), WATCHDOG_ERROR);
+            $delete_item = false;
+          }
+        }
+      } elseif ($no_invoice_required) {
+        $success_orders++;
+        watchdog('vate_myob', 'Order No: %order_num. No payment needed to MYOB', array('%order_num' => $order_num), WATCHDOG_INFO);
+        _remove_order_from_queue($order_id);
+      }
+    } else {
+      watchdog('vate_myob', '(Line %line) Order No: %order_num. MYOB export failed, error when exporting order item.', array('%order_num' => $order_num, '%line' => __LINE__), WATCHDOG_ERROR);
+    }
+  }
+}
+
+/**
+ * Remove from MYOB QUEUE
+ */
+function _remove_order_from_queue($order_id) {
+  // Remove order from Queue
+  db_delete('queue')
+    ->condition('name', MYOB_ORDER_PUSH_QUEUE)
+    ->condition('data', "%" . db_like("\"{$order_id}\"") . "%", 'LIKE')
+    ->execute();
+  $params = array('@id' => $order_id);
+  watchdog('vate_myob', 'The order @id has been removed from MYOB queue.', $params, WATCHDOG_INFO);
+}
+
+/**
+ * Implements hook_entity_info().
+ */
+function vate_myob_entity_info() {
+  return array(
+    'myob_mapping_object' => array(
+      'label' => t('MYOB Object Mapping'),
+      'base table' => 'myob_mapping_object',
+      'entity keys' => array(
+        'id' => 'myob_mapping_object_id',
+      ),
+      'entity class' => 'MYOBMappingObject',
+      'controller class' => 'EntityAPIController',
+    ),
+  );
+}
+
+function vate_myob_save_mapping($entity_type, $entity_id, $myob_type, $myob_id, $order_id = NULL) {
+  $myob_mapping = entity_create('myob_mapping_object', array(
+    'entity_type' => $entity_type,
+    'entity_id' => $entity_id,
+    'myob_type' => $myob_type,
+    'myob_id' => $myob_id,
+    'last_sync' => time(),
+    'order_id' => $order_id,
+  ));
+  $myob_mapping->entity_updated = REQUEST_TIME;
+  $myob_mapping->last_sync_status = MYOB_MAPPING_STATUS_SUCCESS;
+  $myob_mapping->save();
+}
+
+/**
+ * Main function to mapping entities.
+ */
+function vate_myob_upsert_mapping($myobapi, $entity_type, $entity_id, $myob_type, $params, $skip_update = FALSE, $order_id = NULL) {
+  $myob_object_mapping = vate_myob_mapping_object_load_by_drupal($entity_type, $entity_id);
+  if ($myob_object_mapping && ($myob_object_mapping->myob_type == $myob_type)) {
+    // Existing object found, update details
+    $myob_id = $myob_object_mapping->myob_id;
+    if ($skip_update) {
+      return $myob_id;
+    }
+    $updated = $myobapi->updateEntity($myob_type,$myob_id,$params);
+    if ($updated) {
+      $myob_object_mapping->last_sync = time();
+      $myob_object_mapping->entity_updated = REQUEST_TIME;
+      $myob_object_mapping->last_sync_status = MYOB_MAPPING_STATUS_SUCCESS;
+      $myob_object_mapping->save();
+    } else {
+      // todo: handle update error
+    }
+  } else {
+
+    // Init Array.
+    $new_entity = array();
+    // Before create Item, lets check if exist.
+    if ($myob_type == 'item') {
+      // Search if we get this product from MYOB essentials.
+      $product = commerce_product_load($entity_id);
+      $item_existing = $myobapi->listItemsBySku($product->sku);
+      // Item exist?
+      if (isset($item_existing['uid']) && !empty($item_existing['uid'])) {
+        $new_entity = $item_existing;
+      }
+      else {
+        // Let's created then.
+        $new_entity = $myobapi->createEntity($myob_type, $params);
+      }
+    }
+    else {
+
+      if ($myob_type == 'contact') {
+        // Search if we get this product from MYOB essentials.
+        $user_contact = user_load($entity_id);
+      }
+
+      $new_entity = $myobapi->createEntity($myob_type, $params);
+    }
+
+
+    if (isset($new_entity['uid'])) {
+      $myob_id = $new_entity['uid'];
+      // save mapping
+      vate_myob_save_mapping($entity_type, $entity_id, $myob_type, $myob_id, $order_id);
+    } else {
+      // todo: handle create error
+    }
+  }
+  return (!empty($myob_id)) ? $myob_id : false;
+}
+
+/**
+ * Return a MYOB Mapping Object.
+ *
+ * @see entity_load()
+ */
+function vate_myob_mapping_object_load($myob_mapping_object_id, $conditions = array(), $reset = FALSE) {
+  if (!is_bool($myob_mapping_object_id)) {
+    $myob_mapping_object_id = array($myob_mapping_object_id);
+  }
+  $objects = entity_load('myob_mapping_object', $myob_mapping_object_id, $conditions, $reset);
+  return $objects ? reset($objects) : FALSE;
+}
+
+/**
+ * Returns MYOB object mappings for a given Drupal entity.
+ *
+ * @param string $entity_type
+ *   Type of entity to load.
+ * @param int $entity_id
+ *   Unique identifier of the target entity to load.
+ * @param bool $reset
+ *   Whether or not the cache should be cleared and fetch from current data.
+ *
+ * @return MYOBMappingObject
+ *   The requested MYOBMappingObject or FALSE if none was found.
+ */
+function vate_myob_mapping_object_load_by_drupal($entity_type, $entity_id, $reset = FALSE) {
+  $conditions = array(
+    'entity_id' => $entity_id,
+    'entity_type' => $entity_type,
+  );
+  return vate_myob_mapping_object_load(FALSE, $conditions, $reset);
+}
+
+/**
+ * Return MYOB object mappings for a given MYOB object.
+ *
+ * @param string $myob_id
+ *   Unique Id provided by MYOB for the MYOB record.
+ * @param bool $reset
+ *   Whether to reset the cache and retrieve a new record.
+ *s
+ * @return array
+ *   Entities that match the given $myob_id.
+ */
+function vate_myob_mapping_object_load_by_myobid($myob_id, $reset = FALSE) {
+  $conditions = array(
+    'myob_id' => $myob_id,
+  );
+  return vate_myob_mapping_object_load(FALSE, $conditions, $reset);
+}
+
+/**
+ * Helper function to populate MYOB contact params from Drupal order.
+ *
+ * @param object $user
+ *  User entity.
+ *
+ * @param object $order_wrapper
+ *  Commerce Order Entity Wrapper.
+ *
+ * @return array
+ *
+ * @see https://developer.myob.com/api/essentials-accounting/endpoints/contacts/#POST
+ **/
+function vate_myob_get_contact_params($user, $order_wrapper) {
+
+  $prefix = NULL;
+  if (variable_get('myob_testing', FALSE)) {
+    $prefix = "XX_";
+  }
+
+  // Initialize variables.
+  $name = $firstName = $lastName = $phone = $mobile = $fax = NULL;
+
+  // Get details from billing
+  $commerce_customer_billing = $order_wrapper->commerce_customer_billing;
+  $name = $commerce_customer_billing->commerce_customer_address->organisation_name->value();
+  $firstName = $commerce_customer_billing->commerce_customer_address->first_name->value();
+  $lastName = $commerce_customer_billing->commerce_customer_address->last_name->value();
+  $phone = $commerce_customer_billing->field_phone->value();
+  $email = "{$prefix}{$user->mail}";
+
+  // Validate if has User Profile.
+  if ($user_profile = profile2_load_by_user($user, 'member')) {
+    // Wrapper Profile.
+    $user_profile = entity_metadata_wrapper('profile2', $user_profile);
+
+    // Get Personal info from profile.
+    $real_firstNam = trim($user_profile->field_first_name->value());
+    if ($real_firstNam && $real_firstNam != '-') {
+      $firstName = $real_firstNam;
+    }
+    $real_lastName = trim($user_profile->field_surname->value());
+    if ($real_lastName && $real_lastName != '-') {
+      $lastName = $real_lastName;
+    }
+    $real_name = trim($user_profile->field_full_name->value());
+    if ($real_name && $real_name != '-') {
+      $name = $real_name;
+    }
+    $real_phone = trim($user_profile->field_home_phone->value());
+    if ($real_phone && $real_phone != '-') {
+      $phone = trim($real_phone);
+      $phone = str_replace(" ", "", $phone);
+      $phone = str_replace("-", "", $phone);
+      $phone = str_replace("_", "", $phone);
+    }
+    $real_mobile = trim($user_profile->field_mobile->value());
+    if ($real_mobile && $real_mobile != '-') {
+      $mobile = trim($real_mobile);
+      $mobile = str_replace(" ", "", $mobile);
+      $mobile = str_replace("-", "", $mobile);
+      $mobile = str_replace("_", "", $mobile);
+    }
+    $real_fax = trim($user_profile->field_work_fax->value());
+    if ($real_fax && $real_fax != '-') {
+      $fax = $real_fax;
+    }
+  }
+
+  $billingAddress = array (
+    "addressLine1" => $commerce_customer_billing->commerce_customer_address->thoroughfare->value(),
+    "addressLine2" => $commerce_customer_billing->commerce_customer_address->premise->value(),
+    "suburb" => $commerce_customer_billing->commerce_customer_address->locality->value(),
+    "state" => $commerce_customer_billing->commerce_customer_address->administrative_area->value(),
+    "postCode" => $commerce_customer_billing->commerce_customer_address->postal_code->value(),
+    "country" => $commerce_customer_billing->commerce_customer_address->country->value()
+  );
+
+  $commerce_customer_shipping = $order_wrapper->commerce_customer_shipping;
+  if ($commerce_customer_shipping->value()) {
+    $shippingAddress = array (
+      "addressLine1" => $commerce_customer_shipping->commerce_customer_address->thoroughfare->value(),
+      "addressLine2" => $commerce_customer_shipping->commerce_customer_address->premise->value(),
+      "suburb" => $commerce_customer_shipping->commerce_customer_address->locality->value(),
+      "state" => $commerce_customer_shipping->commerce_customer_address->administrative_area->value(),
+      "postCode" => $commerce_customer_shipping->commerce_customer_address->postal_code->value(),
+      "country" => $commerce_customer_shipping->commerce_customer_address->country->value()
+    );
+  }
+
+  // Default if no name.
+  if (!$name || empty($name)) {
+    $name = $user->name;
+  }
+
+  // Validate data standard.
+  $firstName = !empty($firstName) ? $firstName : $name;
+  $firstName = substr($firstName, 0, 50);
+
+  $lastName = !empty($lastName) ? $lastName : $name;
+  $lastName = substr($lastName, 0, 50);
+
+  $phone = substr($phone, 0, 19);
+  $mobile = substr($mobile, 0, 12);
+  $fax = substr($phone, 0, 25);
+  $email = substr($email, 0, 76);
+  $nameMyob = substr("{$prefix}{$name}", 0, 110);
+
+  $params = array(
+    'name' => $nameMyob,
+    'types' => array('Customer'),
+    'firstName' => $firstName,
+    'lastName' => $lastName,
+    'phone' => $phone,
+    'email' => $email,
+    'mobile' => $mobile,
+    'fax' => $fax,
+    'active' => TRUE,
+    'individual' => TRUE,
+  );
+
+  // Validate Organisation.
+  $vateMembership = new vateMembership($user);
+  if ($vateMembership->isOrganisationAdmin) {
+    $params['individual'] = FALSE;
+    $params['business'] = TRUE;
+    $org_name = $vateMembership->getOrganisationName();
+    if ($org_name) {
+        $nameMyob = substr("{$prefix}{$org_name}", 0, 110);
+        $params['name'] = $nameMyob;
+    }
+  }
+
+  if (isset($billingAddress)) {
+    $params['billingAddress'] = $billingAddress;
+    foreach ($params['billingAddress'] as $keyBilling => &$valueBilling) {
+        if ($keyBilling == 'postCode') {
+            $valueBilling = substr($valueBilling, 0, 10);
+        }
+        else {
+            $valueBilling = substr($valueBilling, 0, 50);
+        }
+    }
+  }
+  if (isset($shippingAddress)) {
+    $params['shippingAddress'] = $shippingAddress;
+    foreach ($params['shippingAddress'] as $keyShipping => &$valueShipping) {
+        if ($keyShipping == 'postCode') {
+            $valueShipping = substr($valueShipping, 0, 10);
+        }
+        else {
+            $valueShipping = substr($valueShipping, 0, 50);
+        }
+    }
+  }
+
+  return $params;
+}
+
+/**
+ * Helper function to populate MYOB item params from Drupal order.
+ *
+ * @param object $line_item_wrapper
+ *  Commerce Line Item Entity Wrapper.
+ *
+ * @return array $params
+ *
+ * @see https://developer.myob.com/api/essentials-accounting/endpoints/inventory/items/
+ **/
+function vate_myob_item_params_from_order($line_item_wrapper) {
+  $prefix = NULL;
+  if (variable_get('myob_testing', FALSE)) {
+    $prefix = "XX_";
+  }
+
+  // Initialize variables from Line Item.
+  $product_load = $line_item_wrapper->commerce_product->value();
+  $product_load_w = entity_metadata_wrapper('commerce_product', $product_load);
+  $sku = $line_item_wrapper->commerce_product->sku->value();
+  $skuItem = substr("{$prefix}{$sku}", 0, 28);
+  $product_type = $line_item_wrapper->commerce_product->type->value();
+  $product_id = $line_item_wrapper->commerce_product->getIdentifier();
+  $product_name = $line_item_wrapper->commerce_product->label();
+  $product_name = trim($product_name);
+  $product_name = str_replace("—", "-", $product_name);
+  $nameproduct = substr("{$prefix}{$product_name}", 0, 28);
+  $price = $line_item_wrapper->commerce_product->commerce_price->value();
+  $salePrice = ($price['amount'] / 1.1) / 100;
+
+  $params = array(
+    'number' => $skuItem, // Length must be between 1 and 30
+    'name' => $nameproduct, // Length must be between 1 and 30
+    'description' => $product_name,
+    'unitOfMeasure' => 'QTY',
+    'type' => 'Stock',
+    'active' => TRUE,
+    'salePrice' => number_format($salePrice, 2, '.', ''), // Use base product price exclude GST
+    'saleTaxType' => array('uid' => variable_get('myob_sale_tax_type_uid', '')),
+  );
+
+  // MYOB Income Sales Account for Events.
+  // General.
+  $general_isa = NULL;
+  if (isset($line_item_wrapper->value()->data['event_nid'])) {
+    if ($node_event = $line_item_wrapper->value()->data['event_nid']) {
+      if ($node_event = node_load($node_event)) {
+        $node_event_w = entity_metadata_wrapper('node', $node_event);
+        $general_isa = $node_event_w->field_myob_income_sales_account->value();
+        if ($general_isa && !empty($general_isa)) {
+          $general_isa = trim($general_isa);
+          $params['saleAccount'] = array('uid' => $general_isa);
+        }
+      }
+    }
+  }
+
+  // BOOKS.
+  if ($product_type == 'book' || $product_type == 'pdf' || $product_type == 'print') {
+    // General.
+    $params['saleAccount'] = array('uid' => variable_get('myob_book_sale_account_uid', ''));
+    // Specific.
+    if (isset($product_load->field_myob_income_sales_account)) {
+      $income_uid = $product_load_w->field_myob_income_sales_account->value();
+      if (isset($income_uid) && !empty($income_uid) && $income_uid != '_none_' && vate_myob_validate_sales_accounts($income_uid)) {
+        $params['saleAccount'] = array('uid' => $income_uid);
+      }
+    }
+  }
+  // EVENTS.
+  elseif ($product_type == 'event_session') {
+    $params['saleAccount'] = array('uid' => variable_get('myob_event_booking_sale_account_uid', ''));
+    // Specific.
+    if (isset($product_load->field_myob_income_sales_account)) {
+      $income_uid = $product_load_w->field_myob_income_sales_account->value();
+      if (isset($income_uid) && !empty($income_uid) && $income_uid != '_none_' && vate_myob_validate_sales_accounts($income_uid)) {
+        $params['saleAccount'] = array('uid' => $income_uid);
+      }
+    }
+
+    // Get the product display node from display path
+    if ($display_path = $line_item_wrapper->commerce_display_path->value()) {
+      $display_paths = explode('/', $display_path);
+      if (count($display_paths) == 2 && ($display_paths[0] == 'node') && is_numeric($display_paths[1])) {
+        if ($event_node = node_load($display_paths[1])) {
+          // Prepend the event name to the description.
+          $params['description'] = $event_node->title . ': ' . $params['description'];
+        }
+      }
+    }
+
+    // Set Workshop information.
+    $data = $line_item_wrapper->value()->data;
+    if (!empty($data) && isset($data['event_session_workshop'])) {
+      $workshop = commerce_product_load($data['event_session_workshop']);
+      $workshop_w = entity_metadata_wrapper('commerce_product', $workshop);
+      $skuItem = substr("{$prefix}{$workshop->sku}", 0, 28);
+      $params['number'] = $skuItem;
+      $nameproduct = substr("{$prefix}{$workshop->title}", 0, 28);
+      $params['name'] = $nameproduct;
+      $params['description'] .= " | {$workshop->title}";
+      // Specific.
+      if (isset($workshop->field_myob_income_sales_account)) {
+        $income_uid = $workshop_w->field_myob_income_sales_account->value();
+        if (isset($income_uid) && !empty($income_uid) && $income_uid != '_none_'  && vate_myob_validate_sales_accounts($income_uid)) {
+          $params['saleAccount'] = array('uid' => $income_uid);
+        }
+      }
+    }
+  }
+  // MEMBERSHIPS.
+  elseif ($product_type == 'membership' || $sku == SKU_AATE_JOURNAL_PRODUCT) {
+    $params['saleAccount'] = array('uid' => variable_get('myob_membership_sale_account_uid', ''));
+    // Specific.
+    if (isset($product_load->field_myob_income_sales_account)) {
+      $income_uid = $product_load_w->field_myob_income_sales_account->value();
+      if (isset($income_uid) && !empty($income_uid) && $income_uid != '_none_'  && vate_myob_validate_sales_accounts($income_uid)) {
+        $params['saleAccount'] = array('uid' => $income_uid);
+      }
+    }
+  }
+  else {
+    // By Default.
+    $params['saleAccount'] = array('uid' => variable_get('myob_book_sale_account_uid', ''));
+  }
+
+  return $params;
+}
+
+/**
+ * Helper function to populate MYOB payment params from Drupal order.
+ *
+ * @param object $line_item_wrapper
+ *  Commerce Order Entity Wrapper.
+ *
+ * @param string $myob_invoice_id
+ *  Invoice ID.
+ *
+ * @param string $myob_contact_id
+ *  Contact ID.
+ *
+ * @return array $params
+ **/
+function vate_myob_payment_params_from_order($order_wrapper, $myob_invoice_id, $myob_contact_id) {
+  $prefix = "WSP";
+  if (variable_get('myob_testing', FALSE)) {
+    $prefix = "XXX";
+  }
+
+  // Get Variables.
+  $order_id = $order_wrapper->getIdentifier();
+  $order_num = $order_wrapper->order_number->value();
+
+  // get the success payment for the order
+  $query = new EntityFieldQuery();
+  $query->entityCondition('entity_type', 'commerce_payment_transaction')
+        ->propertyCondition('order_id', $order_id)
+        ->propertyCondition('status', 'success');
+  $results = $query->execute();
+
+  if (!empty($results['commerce_payment_transaction'])) {
+    $commerce_payment_transaction = current($results['commerce_payment_transaction']);
+    $transaction_id = $commerce_payment_transaction->transaction_id;
+    $transaction = commerce_payment_transaction_load($transaction_id);
+    $paymentRef = "{$prefix}" . str_pad($order_num, 5, 0, STR_PAD_LEFT);
+
+    // GET NEXT REFERENCE FROM MYOB (NEW SERVICE).
+    try {
+        $api_key = variable_get('myob_api_key', FALSE);
+        $api_secret = variable_get('myob_api_secret', FALSE);
+        if ($myobapi = new MYOB($api_key, $api_secret)) {
+            $next_ref = $myobapi->getNextPaymentReference();
+            $next_ref = trim($next_ref);
+            if (strlen($next_ref) > 1) {
+                $paymentRef = $next_ref;
+            }
+        }
+    } catch (Exception $e) {
+        watchdog('vate_myob', 'Error getting next payment reference: %error_msg', array('%error_msg' => $e->getMessage()), WATCHDOG_ERROR);
+    }
+
+    $invoices = array();
+    $invoices[] = array(
+      'invoice' => array('uid' => $myob_invoice_id),
+      'paymentAmount' => ($transaction->amount / 100)
+    );
+
+    $params = array(
+      'transaction_id' => $transaction_id,
+      'paymentDate' => date('Y-m-d', $transaction->created),
+      'reference' => substr($paymentRef, 0, 8),
+      'notes' => $transaction->payment_method . ' ID: '. $transaction_id,
+      'account' => array('uid' => variable_get('myob_payment_account_uid', '')),
+      'customer' => array('uid' => $myob_contact_id),
+      'invoices' => $invoices
+    );
+    if (!empty($transaction->remote_id)) {
+      $params['notes'] .= ' Remote ID: '. $transaction->remote_id;
+    }
+
+    if ($order_id) {
+        $params['notes'] .= " / Web order #: {$order_id}";
+    }
+
+    return $params;
+  }
+
+  return FALSE;
+}
+
+function vate_myob_sort_form($form, &$form_state) {
+
+  $default = isset($_GET['sort_by']) ? $_GET['sort_by'] : NULL;
+  $form['sort'] = array(
+    '#type' => 'select',
+    '#title' => t('Sort'),
+    '#title_display' => 'invisible',
+    '#options' => array(
+      'title' => t('Alphabetical order by title'),
+      'field_book_author_value' => t('Alphabetical order by author'),
+    ),
+    '#default_value' => $default,
+  );
+
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Submit'),
+    '#name' => 'submit',
+    '#attributes' => array(
+      'class' => array('hide')
+    ),
+    '#submit' => array(
+      'vate_myob_sort_form_submit'
+    ),
+  );
+
+  return $form;
+}
+
+function vate_myob_sort_form_submit($form, &$form_state) {
+  $page_query = array();
+  $path = 'shop';
+  foreach ($_GET as $key => $value) {
+    if (!$key == 'q') {
+      $page_query[$key] = $value;
+    }
+  }
+
+  if (isset($form_state['values']['sort'])) {
+    $page_query['sort_by'] = $form_state['values']['sort'];
+    $page_query['sort_order'] = 'ASC';
+  }
+
+  drupal_goto($path, array('query' => $page_query));
+}
+
+
+function vate_myob_book_search_form($form, &$form_state) {
+
+  $default = isset($_GET['subcategory']) ? $_GET['subcategory'] : NULL;
+  $default_text = isset($_GET['titleauthor']) ? $_GET['titleauthor'] : NULL;
+
+  $options = array(
+    'All' => "- All Categories -",
+  );
+  if ($vocab = taxonomy_vocabulary_machine_name_load('books')) {
+    $book_categories = taxonomy_get_tree($vocab->vid);
+    foreach ($book_categories as $book_category) {
+      $options[$book_category->tid] = $book_category->name;
+    }
+  }
+
+  $form['subcategory'] = array(
+    '#prefix' => '<div class="elemn-form col-sm-3 col-xs-12">',
+    '#suffix' => '</div>',
+    '#type' => 'select',
+    '#title' => t('Sort'),
+    '#title_display' => 'invisible',
+    '#options' => $options,
+    '#default_value' => $default,
+  );
+
+  $form['text'] = array(
+    '#prefix' => '<div class="elemn-form col-sm-7 col-xs-12">',
+    '#suffix' => '</div>',
+    '#type' => 'textfield',
+    '#title' => t('Text'),
+    '#title_display' => 'invisible',
+    '#attributes' => array(
+      'placeholder' => 'Search for books by title or author....'
+    ),
+    '#default_value' => $default_text,
+  );
+
+  $form['search'] = array(
+    '#prefix' => '<div class="elemn-form col-sm-2 col-xs-12">',
+    '#suffix' => '</div>',
+    '#type' => 'submit',
+    '#value' => t('Search'),
+    '#name' => 'submit',
+    '#attributes' => array(
+      'class' => array('btn', 'btn-primary', 'col-sm-2', 'col-xs-2')
+    ),
+    '#validate' => array(
+      'vate_myob_book_search_form_validate'
+    ),
+  );
+
+  return $form;
+}
+
+/**
+ * [vate_myob_book_search_form_submit description]
+ */
+function vate_myob_book_search_form_validate($form, &$form_state) {
+  $page_query = array();
+  $path = 'shop';
+
+  foreach ($_GET as $key => $value) {
+    if (!$key == 'q') {
+      $page_query[$key] = $value;
+    }
+  }
+
+  if (isset($form_state['values']['text'])) {
+    $page_query['titleauthor'] = $form_state['values']['text'];
+  }
+
+  if (isset($form_state['values']['subcategory'])) {
+    $page_query['subcategory'] = $form_state['values']['subcategory'];
+  }
+
+  drupal_goto($path, array('query' => $page_query));
+}
+
+
+/**
+ * Implements hook_field_widget_info().
+ */
+function vate_myob_field_widget_info() {
+  return array(
+    'vate_myob_sales_income' => array(
+      'label' => t("MYOB: Sales Income"),
+      'field types' => array('text'),
+      'settings' => array(),
+      'behaviors' => array(
+        'multiple values' => FIELD_BEHAVIOR_DEFAULT,
+        'default value' => FIELD_BEHAVIOR_DEFAULT,
+      )
+    ),
+  );
+}
+
+/**
+ * Implements hook_field_widget_settings_form().
+ */
+function vate_myob_field_widget_settings_form($field, $instance) {
+  $widget = $instance['widget'];
+  $settings = $widget['settings'];
+  $form = array();
+  return $form;
+}
+
+/**
+ * Implements hook_field_widget_form().
+ */
+function vate_myob_field_widget_form(&$form, &$form_state, $field, $instance, $langcode, $items, $delta, $element) {
+
+  $widget = $instance['widget'];
+  $settings = $widget['settings'];
+
+  $required = FALSE;
+  if (isset($instance['required']) && $instance['required'] == TRUE) {
+    $required = TRUE;
+    $form_state['storage']['required'] = $required;
+  }
+
+  $options = array('_none_' => '- None -');
+  // Get current MYOB ISA.
+  $options += vate_myob_get_isa();
+
+  $main_widget = array();
+  $main_widget = $element + array(
+    '#type' => 'select',
+    '#options' => $options,
+    '#default_value' => isset($items[$delta]['value']) ? $items[$delta]['value'] : NULL,
+    '#required' => $required,
+  );
+  $element['value'] = $main_widget;
+
+  return $element;
+}
